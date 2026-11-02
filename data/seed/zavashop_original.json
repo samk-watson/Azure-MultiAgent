@@ -1,0 +1,155 @@
+{
+  "carrier_services": [
+    {
+      "base_cost": 180.0,
+      "carrier": "Northwind Freight",
+      "destination_store_ids": [
+        "store-101",
+        "store-202"
+      ],
+      "eta_days": 2,
+      "per_unit_cost": 0.42,
+      "service_level": "priority-truckload"
+    },
+    {
+      "base_cost": 95.0,
+      "carrier": "Blue Yonder Logistics",
+      "destination_store_ids": [
+        "store-101",
+        "store-202",
+        "wh-east"
+      ],
+      "eta_days": 4,
+      "per_unit_cost": 0.28,
+      "service_level": "standard-ltl"
+    },
+    {
+      "base_cost": 360.0,
+      "carrier": "Fabrikam RapidShip",
+      "destination_store_ids": [
+        "store-101"
+      ],
+      "eta_days": 1,
+      "per_unit_cost": 0.75,
+      "service_level": "same-day-expedite"
+    }
+  ],
+  "format_version": 1,
+  "inventory_positions": [
+    {
+      "days_until_stockout": 2,
+      "location_id": "store-101",
+      "on_hand": 6,
+      "reorder_point": 24,
+      "reserved": 4,
+      "sku": "ZS-1042"
+    },
+    {
+      "days_until_stockout": 16,
+      "location_id": "store-202",
+      "on_hand": 84,
+      "reorder_point": 30,
+      "reserved": 9,
+      "sku": "ZS-1042"
+    },
+    {
+      "days_until_stockout": 30,
+      "location_id": "wh-east",
+      "on_hand": 420,
+      "reorder_point": 150,
+      "reserved": 65,
+      "sku": "ZS-1042"
+    },
+    {
+      "days_until_stockout": 12,
+      "location_id": "store-101",
+      "on_hand": 38,
+      "reorder_point": 20,
+      "reserved": 3,
+      "sku": "ZS-2048"
+    },
+    {
+      "days_until_stockout": 9,
+      "location_id": "store-202",
+      "on_hand": 22,
+      "reorder_point": 18,
+      "reserved": 2,
+      "sku": "ZS-2048"
+    },
+    {
+      "days_until_stockout": 25,
+      "location_id": "wh-east",
+      "on_hand": 160,
+      "reorder_point": 80,
+      "reserved": 20,
+      "sku": "ZS-2048"
+    }
+  ],
+  "retail_prices": [
+    {
+      "category": "seasonal apparel",
+      "ceiling_price": 44.99,
+      "current_price": 39.99,
+      "floor_price": 34.99,
+      "location_id": "store-101",
+      "sku": "ZS-1042",
+      "unit_cost": 18.75
+    },
+    {
+      "category": "seasonal apparel",
+      "ceiling_price": 43.99,
+      "current_price": 38.49,
+      "floor_price": 33.99,
+      "location_id": "store-202",
+      "sku": "ZS-1042",
+      "unit_cost": 18.75
+    },
+    {
+      "category": "home basics",
+      "ceiling_price": 29.99,
+      "current_price": 24.99,
+      "floor_price": 21.99,
+      "location_id": "store-101",
+      "sku": "ZS-2048",
+      "unit_cost": 12.4
+    }
+  ],
+  "supplier_offers": [
+    {
+      "available_qty": 900,
+      "lead_time_days": 4,
+      "name": "Northstar Apparel Manufacturing",
+      "reliability_score": 0.97,
+      "sku": "ZS-1042",
+      "supplier_id": "sup-northstar",
+      "unit_cost": 18.75
+    },
+    {
+      "available_qty": 500,
+      "lead_time_days": 6,
+      "name": "Contoso Textiles Direct",
+      "reliability_score": 0.91,
+      "sku": "ZS-1042",
+      "supplier_id": "sup-contoso-textiles",
+      "unit_cost": 17.95
+    },
+    {
+      "available_qty": 240,
+      "lead_time_days": 2,
+      "name": "Fabrikam Rapid Replenishment",
+      "reliability_score": 0.88,
+      "sku": "ZS-1042",
+      "supplier_id": "sup-fabrikam-rapid",
+      "unit_cost": 20.1
+    },
+    {
+      "available_qty": 320,
+      "lead_time_days": 5,
+      "name": "Contoso Textiles Direct",
+      "reliability_score": 0.91,
+      "sku": "ZS-2048",
+      "supplier_id": "sup-contoso-textiles",
+      "unit_cost": 12.4
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "format_version": 1,
+  "locations": [
+    {"location_id": "store-101", "location_type": "store"},
+    {"location_id": "store-202", "location_type": "store"},
+    {"location_id": "wh-east", "location_type": "warehouse"}
+  ],
+  "inbound_inventory": [
+    {"inbound_id": "demo-inbound-01", "sku": "ZS-1042", "location_id": "store-101", "quantity": 20, "expected_date": "2026-11-10", "status": "planned"}
+  ],
+  "inventory_policies": [
+    {"sku": "ZS-1042", "location_id": "store-101", "target_stock": 48, "safety_stock": 12},
+    {"sku": "ZS-2048", "location_id": "store-101", "target_stock": 40, "safety_stock": 8}
+  ],
+  "location_transfer_rules": [
+    {"origin_id": "store-202", "destination_id": "store-101", "eligible": true, "transit_days": 2},
+    {"origin_id": "wh-east", "destination_id": "store-101", "eligible": true, "transit_days": 3}
+  ],
+  "demand_history": [
+    {"sku": "ZS-1042", "location_id": "store-101", "demand_date": "2026-10-27", "units_sold": 5},
+    {"sku": "ZS-1042", "location_id": "store-101", "demand_date": "2026-10-28", "units_sold": 6},
+    {"sku": "ZS-1042", "location_id": "store-101", "demand_date": "2026-10-29", "units_sold": 4}
+  ],
+  "shipping_lanes": [
+    {"origin_id": "wh-east", "destination_id": "store-101", "carrier": "Northwind Freight", "service_level": "priority-truckload", "eligible": true}
+  ],
+  "pricing_history": [
+    {"sku": "ZS-1042", "location_id": "store-101", "effective_date": "2026-10-01", "price": 37.99}
+  ]
+}

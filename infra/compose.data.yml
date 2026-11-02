@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: azure_multiagent
+      POSTGRES_USER: azure_multiagent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - azure_multiagent_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U azure_multiagent -d azure_multiagent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+volumes:
+  azure_multiagent_pgdata:

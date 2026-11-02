@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "azure-multiagent-inventory-mcp"
+version = "0.1.0"
+description = "Read-only MCP server for the Azure-MultiAgent inventory service"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp==2.3.0",
+    "psycopg[binary]>=3.2,<4",
+    "pydantic>=2.12,<3",
+]
+
+[project.scripts]
+inventory-mcp = "inventory_mcp_server.__main__:main"
+
+[tool.setuptools]
+packages = ["inventory_mcp_server", "services.inventory"]
+
+[tool.setuptools.package-dir]
+inventory_mcp_server = "src/inventory_mcp_server"
+"services.inventory" = "../../services/inventory"
