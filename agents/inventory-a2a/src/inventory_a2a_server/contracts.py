@@ -8,7 +8,7 @@ from a2a.helpers import get_data_parts
 from a2a.types import Message, Part, Role
 from pydantic import ValidationError
 
-from inventory_agent.models import InventoryAgentRequest, InventoryAgentResult
+from inventory_contracts import InventoryAgentRequest, InventoryAgentResult
 
 MAX_EXACT_PROTOBUF_INTEGER = (1 << 53) - 1
 JSON_MEDIA_TYPE = "application/json"

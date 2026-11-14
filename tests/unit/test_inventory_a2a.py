@@ -405,6 +405,42 @@ async def test_valid_assessment_is_completed_with_full_structured_artifact() -> 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scope_change",
+    [
+        {"operation": "inbound_lookup"},
+        {"sku": "OTHER-SKU"},
+        {"location_id": "store-999"},
+        {"correlation_id": "other-correlation"},
+    ],
+)
+async def test_result_with_mismatched_request_scope_fails_closed(
+    scope_change: dict[str, str],
+) -> None:
+    mismatched = result().model_copy(update=scope_change)
+    executor = InventoryAgentExecutor(FakeInvoker(mismatched))
+    queue = EventRecorder()
+
+    await executor.execute(
+        request_context(
+            request_message(
+                {
+                    "sku": "ZS-1042",
+                    "location_id": "store-101",
+                    "correlation_id": "business-correlation",
+                }
+            )
+        ),
+        queue,
+    )
+
+    assert status_events(queue)[-1].status.state == TaskState.TASK_STATE_FAILED
+    artifact = artifact_data(artifact_events(queue)[0])
+    assert artifact["error"]["code"] == "AGENT_EXECUTION_ERROR"
+    assert "OTHER-SKU" not in str(artifact)
+
+
+@pytest.mark.asyncio
 async def test_inbound_lookup_is_delegated_and_returned_as_structured_data() -> None:
     inbound = InventoryAgentResult(
         operation="inbound_lookup",

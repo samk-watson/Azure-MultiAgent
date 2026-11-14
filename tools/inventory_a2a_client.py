@@ -51,7 +51,7 @@ def _artifact_data(task: Task | None, response: Any) -> list[dict[str, Any]]:
     return data_items
 
 
-async def test_inventory_agent(
+async def send_assessment(
     sku: str,
     location_id: str,
     endpoint: str = DEFAULT_ENDPOINT,
@@ -143,7 +143,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    return asyncio.run(test_inventory_agent(args.sku, args.location_id))
+    return asyncio.run(send_assessment(args.sku, args.location_id))
 
 
 if __name__ == "__main__":

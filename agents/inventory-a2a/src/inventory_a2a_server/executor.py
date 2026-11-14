@@ -11,7 +11,7 @@ from a2a.server.events import EventQueue
 from a2a.server.tasks import TaskUpdater
 from a2a.types import Task, TaskState
 
-from inventory_agent.models import InventoryAgentRequest, InventoryAgentResult
+from inventory_contracts import InventoryAgentRequest, InventoryAgentResult
 from inventory_a2a_server.contracts import (
     RequestContractError,
     inventory_result_data,

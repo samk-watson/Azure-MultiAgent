@@ -7,7 +7,7 @@ from typing import Protocol
 
 from inventory_agent.graph import run_inventory_agent
 from inventory_agent.mcp_client import MCPToolClient, create_remote_client
-from inventory_agent.models import InventoryAgentRequest, InventoryAgentResult
+from inventory_contracts import InventoryAgentRequest, InventoryAgentResult
 
 
 class AsyncClient(Protocol):
