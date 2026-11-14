@@ -1,0 +1,5 @@
+# Append these lines to the existing Azure-MultiAgent .gitignore
+.env
+.venv/
+__pycache__/
+.pytest_cache/

@@ -1,0 +1,2 @@
+[console_scripts]
+inventory-agent = inventory_agent.runner:main

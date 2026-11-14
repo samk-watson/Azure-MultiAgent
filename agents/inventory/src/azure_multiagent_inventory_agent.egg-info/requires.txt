@@ -1,0 +1,9 @@
+anyio<5,>=4.5
+httpx2<3,>=2.10
+langgraph==1.2.4
+mcp==2.3.0
+pydantic<3,>=2.12
+
+[test]
+pytest<10,>=8
+pytest-asyncio<1,>=0.23

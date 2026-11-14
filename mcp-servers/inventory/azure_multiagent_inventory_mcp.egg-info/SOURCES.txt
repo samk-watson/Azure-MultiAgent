@@ -1,0 +1,16 @@
+pyproject.toml
+../../services/inventory/__init__.py
+../../services/inventory/models.py
+../../services/inventory/repository.py
+../../services/inventory/service.py
+azure_multiagent_inventory_mcp.egg-info/PKG-INFO
+azure_multiagent_inventory_mcp.egg-info/SOURCES.txt
+azure_multiagent_inventory_mcp.egg-info/dependency_links.txt
+azure_multiagent_inventory_mcp.egg-info/entry_points.txt
+azure_multiagent_inventory_mcp.egg-info/requires.txt
+azure_multiagent_inventory_mcp.egg-info/top_level.txt
+src/inventory_mcp_server/__init__.py
+src/inventory_mcp_server/__main__.py
+src/inventory_mcp_server/contracts.py
+src/inventory_mcp_server/errors.py
+src/inventory_mcp_server/server.py

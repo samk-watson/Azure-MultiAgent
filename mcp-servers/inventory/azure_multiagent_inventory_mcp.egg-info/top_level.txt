@@ -1,0 +1,2 @@
+inventory_mcp_server
+services

@@ -1,0 +1,2 @@
+[console_scripts]
+inventory-mcp = inventory_mcp_server.__main__:main
