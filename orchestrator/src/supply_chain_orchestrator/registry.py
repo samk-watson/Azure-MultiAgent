@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ipaddress
 import math
 import os
+import socket
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -12,6 +14,27 @@ _DEFAULT_OPERATION_SKILLS = {
     "assess": "inventory-assessment",
     "inbound_lookup": "inbound-lookup",
 }
+
+
+def _validate_loopback_host(host: str, *, name: str) -> None:
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        if host.lower() != "localhost":
+            raise ValueError(f"{name} must use a loopback address")
+        try:
+            resolved = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise ValueError(f"{name} must resolve exclusively to loopback addresses") from exc
+        addresses = {
+            ipaddress.ip_address(result[4][0])
+            for result in resolved
+        }
+        if not addresses or any(not address.is_loopback for address in addresses):
+            raise ValueError(f"{name} must resolve exclusively to loopback addresses")
+    else:
+        if not address.is_loopback:
+            raise ValueError(f"{name} must use a loopback address")
 
 
 def _origin(url: str, *, name: str) -> tuple[str, str, int]:
@@ -31,6 +54,7 @@ def _origin(url: str, *, name: str) -> tuple[str, str, int]:
         or parsed.fragment
     ):
         raise ValueError(f"{name} must be a valid absolute HTTP(S) URL")
+    _validate_loopback_host(parsed.hostname, name=name)
     if port is not None and not 1 <= port <= 65535:
         raise ValueError(f"{name} must use a valid TCP port")
     if name == "base_url" and parsed.path not in {"", "/"}:

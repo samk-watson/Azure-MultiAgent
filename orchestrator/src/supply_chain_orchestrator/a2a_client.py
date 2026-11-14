@@ -4,21 +4,103 @@ import asyncio
 import logging
 import math
 import os
-import re
 from collections.abc import AsyncIterator, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Annotated, Any, Literal, Protocol
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StringConstraints,
+    ValidationError,
+    field_validator,
+)
 from a2a.client import (
     A2ACardResolver,
     ClientCallContext,
     ClientConfig,
     ClientFactory,
 )
+_SafeCode = Annotated[
+    str,
+    StringConstraints(strict=True, pattern=r"^[A-Z][A-Z0-9_]{0,63}$"),
+]
+
+
+class _StrictArtifactModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+
+class InventoryAgentErrorDetail(_StrictArtifactModel):
+    code: _SafeCode
+    message: str
+    step: Literal[
+        "validate_request",
+        "assess_inventory",
+        "get_transfer_candidates",
+        "get_inbound_inventory",
+        "agent",
+    ]
+    retryable: StrictBool
+    attempts: Annotated[int, Field(strict=True, ge=1)]
+
+    @field_validator("code")
+    @classmethod
+    def validate_safe_code(cls, value: str) -> str:
+        if value not in _SAFE_AGENT_ERROR_CODES:
+            raise ValueError("unrecognized safe Inventory agent error code")
+        return value
+
+    @field_validator("message")
+    @classmethod
+    def validate_safe_message(cls, value: str) -> str:
+        if value not in _SAFE_AGENT_ERROR_MESSAGES:
+            raise ValueError("unrecognized safe Inventory agent error message")
+        return value
+
+
+class InventoryA2AErrorDetails(_StrictArtifactModel):
+    dependency_error_codes: list[_SafeCode] = Field(default_factory=list)
+    agent_errors: list[InventoryAgentErrorDetail] = Field(default_factory=list)
+
+    @field_validator("dependency_error_codes")
+    @classmethod
+    def validate_dependency_codes(cls, value: list[str]) -> list[str]:
+        if any(code not in _SAFE_AGENT_ERROR_CODES for code in value):
+            raise ValueError("unrecognized safe Inventory dependency error code")
+        return value
+
+
+class InventoryA2AError(_StrictArtifactModel):
+    code: _SafeCode
+    message: str
+    details: InventoryA2AErrorDetails | None = None
+
+    @field_validator("code")
+    @classmethod
+    def validate_safe_code(cls, value: str) -> str:
+        if value not in _SAFE_TASK_ERROR_CODES:
+            raise ValueError("unrecognized safe Inventory task error code")
+        return value
+
+    @field_validator("message")
+    @classmethod
+    def validate_safe_message(cls, value: str) -> str:
+        if value not in _SAFE_TASK_ERROR_MESSAGES:
+            raise ValueError("unrecognized safe Inventory task error message")
+        return value
+
+
+class InventoryA2AErrorArtifact(_StrictArtifactModel):
+    schema_version: Literal["1.0"]
+    error: InventoryA2AError
+    correlation_id: str | None
 from a2a.client.errors import A2AClientError, A2AClientTimeoutError
 from a2a.helpers import get_data_parts, new_data_part
 from a2a.types import (
@@ -41,7 +123,56 @@ from supply_chain_orchestrator.registry import (
 
 logger = logging.getLogger(__name__)
 MAX_EXACT_PROTOBUF_INTEGER = (1 << 53) - 1
-_SAFE_ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
+_SAFE_AGENT_ERROR_MESSAGES = frozenset(
+    {
+        "The requested SKU does not exist.",
+        "The requested location does not exist.",
+        "No inventory position exists for this scope.",
+        "No inventory policy exists for this scope.",
+        "Inventory database configuration is unavailable.",
+        "Inventory data could not be retrieved.",
+        "The Inventory MCP service could not be reached.",
+        "The Inventory MCP request failed.",
+        "The Inventory MCP tool returned an execution error.",
+        "The Inventory MCP tool returned invalid structured data.",
+        "An inventory dependency failed.",
+    }
+)
+_SAFE_AGENT_ERROR_CODES = frozenset(
+    {
+        "UNKNOWN_SKU",
+        "UNKNOWN_LOCATION",
+        "INVENTORY_POSITION_NOT_FOUND",
+        "INVENTORY_POLICY_NOT_FOUND",
+        "DATABASE_CONFIGURATION_ERROR",
+        "DATABASE_ERROR",
+        "MCP_TIMEOUT",
+        "MCP_TRANSPORT_ERROR",
+        "MCP_CLIENT_ERROR",
+        "MCP_TOOL_ERROR",
+        "MALFORMED_MCP_RESULT",
+        "INVALID_REQUEST",
+        "AGENT_TASK_TIMEOUT",
+        "AGENT_EXECUTION_ERROR",
+        "AGENT_DEPENDENCY_FAILURE",
+        "INCONSISTENT_INVENTORY_POSITION",
+        "AGENT_ERROR",
+    }
+)
+_SAFE_TASK_ERROR_CODES = frozenset(
+    {
+        "AGENT_DEPENDENCY_FAILURE",
+        "AGENT_TASK_TIMEOUT",
+        "AGENT_EXECUTION_ERROR",
+    }
+)
+_SAFE_TASK_ERROR_MESSAGES = frozenset(
+    {
+        "An inventory dependency failed before a valid assessment was available.",
+        "The inventory assessment exceeded its configured time limit.",
+        "The inventory assessment could not be completed.",
+    }
+)
 _POLLABLE_STATES = frozenset(
     {
         TaskState.TASK_STATE_SUBMITTED,
@@ -100,7 +231,7 @@ class A2AInvocationError(Exception):
         correlation_id: str | None,
         task_id: str | None = None,
         task_state: str | None = None,
-        remote_error_code: str | None = None,
+        remote_error: InventoryA2AErrorArtifact | None = None,
         retryable: bool = False,
     ) -> None:
         super().__init__(message)
@@ -110,7 +241,18 @@ class A2AInvocationError(Exception):
         self.correlation_id = correlation_id
         self.task_id = task_id
         self.task_state = task_state
-        self.remote_error_code = remote_error_code
+        self.remote_error = remote_error
+        self.remote_error_code = (
+            remote_error.error.code if remote_error is not None else None
+        )
+        self.remote_error_message = (
+            remote_error.error.message if remote_error is not None else None
+        )
+        details = remote_error.error.details if remote_error is not None else None
+        self.dependency_error_codes = (
+            tuple(details.dependency_error_codes) if details is not None else ()
+        )
+        self.agent_errors = tuple(details.agent_errors) if details is not None else ()
         self.retryable = retryable
 
 
@@ -302,16 +444,20 @@ def _artifact_payload(task: Task, expected_name: str) -> dict[str, Any]:
     return data_parts[0]
 
 
-def _remote_error_code(task: Task) -> str | None:
+def _remote_error_details(
+    task: Task,
+    *,
+    expected_correlation_id: str | None,
+) -> InventoryA2AErrorArtifact | None:
     try:
-        artifact = _artifact_payload(task, "inventory-agent-error")
-    except (ValueError, TypeError, IndexError):
+        artifact = InventoryA2AErrorArtifact.model_validate(
+            _artifact_payload(task, "inventory-agent-error")
+        )
+    except (ValueError, TypeError, IndexError, ValidationError):
         return None
-    error = artifact.get("error")
-    if not isinstance(error, dict):
+    if artifact.correlation_id != expected_correlation_id:
         return None
-    code = error.get("code")
-    return code if isinstance(code, str) and _SAFE_ERROR_CODE.fullmatch(code) else None
+    return artifact
 
 
 def _has_transport_cause(error: BaseException) -> bool:
@@ -574,7 +720,10 @@ class InventoryA2AClient:
                 correlation_id=request.correlation_id,
                 task_id=task.id,
                 task_state=state,
-                remote_error_code=_remote_error_code(task),
+                remote_error=_remote_error_details(
+                    task,
+                    expected_correlation_id=request.correlation_id,
+                ),
             )
 
         artifact = _artifact_payload(task, "inventory-agent-result")
@@ -588,6 +737,7 @@ class InventoryA2AClient:
             or result.correlation_id != request.correlation_id
         ):
             raise ValueError("Inventory result scope does not match the request")
+        self._validate_nested_evidence_scope(result, request)
         if result.status in {"complete", "partial"}:
             if request.operation == "assess" and (
                 result.assessment is None or result.inbound_result is not None
@@ -606,6 +756,68 @@ class InventoryA2AClient:
             correlation_id=result.correlation_id,
             result=result,
         )
+
+    @staticmethod
+    def _validate_nested_evidence_scope(
+        result: InventoryAgentResult,
+        request: InventoryAgentRequest,
+    ) -> None:
+        assessment = result.assessment
+        if assessment is not None:
+            if (assessment.sku, assessment.location_id) != (
+                request.sku,
+                request.location_id,
+            ):
+                raise ValueError("Inventory assessment scope does not match request")
+            position = assessment.position
+            if (position.sku, position.location_id) != (
+                request.sku,
+                request.location_id,
+            ):
+                raise ValueError("Inventory position scope does not match request")
+            policy = assessment.policy
+            if policy is not None and (policy.sku, policy.location_id) != (
+                request.sku,
+                request.location_id,
+            ):
+                raise ValueError("Inventory policy scope does not match request")
+            for item in assessment.inbound_inventory:
+                if (item.sku, item.location_id) != (
+                    request.sku,
+                    request.location_id,
+                ):
+                    raise ValueError("Assessment inbound evidence scope mismatch")
+
+        inbound_result = result.inbound_result
+        if inbound_result is not None:
+            if (inbound_result.sku, inbound_result.location_id) != (
+                request.sku,
+                request.location_id,
+            ):
+                raise ValueError("Inbound result scope does not match request")
+            for item in inbound_result.items:
+                if (item.sku, item.location_id) != (
+                    request.sku,
+                    request.location_id,
+                ):
+                    raise ValueError("Inbound evidence scope mismatch")
+
+        transfers = result.transfer_candidates
+        if transfers is not None:
+            if (transfers.sku, transfers.destination_id) != (
+                request.sku,
+                request.location_id,
+            ):
+                raise ValueError("Transfer candidate result scope does not match request")
+            for candidate in transfers.candidates:
+                if candidate.destination_id != transfers.destination_id:
+                    raise ValueError("Transfer candidate destination scope mismatch")
+                donor = candidate.donor_position
+                if donor is not None and (
+                    donor.sku != transfers.sku
+                    or donor.location_id != candidate.origin_id
+                ):
+                    raise ValueError("Transfer donor evidence scope mismatch")
 
     async def _cancel_best_effort(
         self,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 from contextlib import asynccontextmanager
 from datetime import date
 from typing import Any
@@ -24,7 +25,11 @@ from a2a.types import (
     TaskState,
     TaskStatus,
 )
-from inventory_contracts import AgentError, InventoryAgentRequest, InventoryAgentResult
+from inventory_contracts import (
+    AgentError,
+    InventoryAgentRequest,
+    InventoryAgentResult,
+)
 
 from supply_chain_orchestrator.a2a_client import (
     A2AClientSettings,
@@ -39,7 +44,9 @@ from supply_chain_orchestrator.registry import (
     SpecialistSpec,
 )
 
-BASE_URL = "http://inventory.test"
+import supply_chain_orchestrator.registry as registry_module
+
+BASE_URL = "http://127.0.0.1:8001"
 RPC_URL = f"{BASE_URL}/a2a"
 TASK_ID = "task-inventory-1"
 CORRELATION_ID = "orchestrator-correlation"
@@ -157,6 +164,23 @@ def task_with_result(
     artifact_name: str = "inventory-agent-result",
     media_type: str = "application/json",
 ) -> Task:
+    return task_with_result_payload(
+        result.model_dump(mode="json", exclude_none=False),
+        state=state,
+        task_id=task_id,
+        artifact_name=artifact_name,
+        media_type=media_type,
+    )
+
+
+def task_with_result_payload(
+    payload: dict[str, Any],
+    *,
+    state: int = TaskState.TASK_STATE_COMPLETED,
+    task_id: str = TASK_ID,
+    artifact_name: str = "inventory-agent-result",
+    media_type: str = "application/json",
+) -> Task:
     return Task(
         id=task_id,
         context_id="inventory-context",
@@ -166,7 +190,7 @@ def task_with_result(
                 name=artifact_name,
                 parts=[
                     new_data_part(
-                        result.model_dump(mode="json", exclude_none=False),
+                        payload,
                         media_type=media_type,
                     )
                 ],
@@ -179,7 +203,15 @@ def task_with_error(
     *,
     state: int,
     code: str = "AGENT_DEPENDENCY_FAILURE",
+    message: str = "An inventory dependency failed before a valid assessment was available.",
+    details: dict[str, Any] | None = None,
+    extra_fields: dict[str, Any] | None = None,
 ) -> Task:
+    error: dict[str, Any] = {"code": code, "message": message}
+    if details is not None:
+        error["details"] = details
+    if extra_fields:
+        error.update(extra_fields)
     return Task(
         id=TASK_ID,
         context_id="inventory-context",
@@ -191,10 +223,7 @@ def task_with_error(
                     new_data_part(
                         {
                             "schema_version": "1.0",
-                            "error": {
-                                "code": code,
-                                "message": "Safe remote error.",
-                            },
+                            "error": error,
                             "correlation_id": CORRELATION_ID,
                         },
                         media_type="application/json",
@@ -318,19 +347,64 @@ def test_registry_maps_inventory_operations_and_rejects_bad_origins(
         )
 
 
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "http://192.0.2.20:8001",
+        "https://inventory.example",
+        "http://localhost.evil:8001",
+    ],
+)
+def test_registry_rejects_non_loopback_endpoints(endpoint: str) -> None:
+    with pytest.raises(ValueError, match="loopback"):
+        SpecialistRegistry.with_inventory(endpoint)
+
+
+def test_registry_accepts_ip_loopback_endpoints_and_validated_localhost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert SpecialistRegistry.with_inventory("http://127.0.0.1:8001")
+    assert SpecialistRegistry.with_inventory("http://[::1]:8001")
+
+    monkeypatch.setattr(
+        registry_module.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 0, 0, 0)),
+        ],
+    )
+    assert SpecialistRegistry.with_inventory("http://localhost:8001")
+
+
+def test_registry_rejects_localhost_if_any_resolution_is_remote(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        registry_module.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.20", 0)),
+        ],
+    )
+    with pytest.raises(ValueError, match="resolve exclusively"):
+        SpecialistRegistry.with_inventory("http://localhost:8001")
+
+
 def test_registry_and_client_settings_are_environment_configurable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from supply_chain_orchestrator.a2a_client import A2AClientSettings
 
-    monkeypatch.setenv("INVENTORY_A2A_URL", "https://inventory.example")
+    monkeypatch.setenv("INVENTORY_A2A_URL", "https://127.0.0.1:8443")
     monkeypatch.setenv("ORCHESTRATOR_A2A_REQUEST_TIMEOUT_SECONDS", "3")
     monkeypatch.setenv("ORCHESTRATOR_A2A_TASK_TIMEOUT_SECONDS", "45")
     monkeypatch.setenv("ORCHESTRATOR_A2A_POLL_INTERVAL_SECONDS", "0.5")
     monkeypatch.setenv("ORCHESTRATOR_A2A_CANCEL_TIMEOUT_SECONDS", "1")
 
     assert SpecialistRegistry.from_environment().get("inventory").base_url == (
-        "https://inventory.example"
+        "https://127.0.0.1:8443"
     )
     assert A2AClientSettings.from_environment() == A2AClientSettings(
         request_timeout_seconds=3,
@@ -465,6 +539,304 @@ async def test_completed_task_preserves_domain_failed_inventory_result() -> None
     assert invocation.task_state == "TASK_STATE_COMPLETED"
     assert invocation.result.status == "failed"
     assert invocation.result.errors[0].code == "UNKNOWN_SKU"
+
+
+@pytest.mark.asyncio
+async def test_failed_task_preserves_validated_structured_infrastructure_errors() -> None:
+    client = FakeClient(
+        task_with_error(
+            state=TaskState.TASK_STATE_FAILED,
+            details={
+                "dependency_error_codes": ["MCP_CLIENT_ERROR"],
+                "agent_errors": [
+                    {
+                        "code": "MCP_CLIENT_ERROR",
+                        "message": "The Inventory MCP request failed.",
+                        "step": "assess_inventory",
+                        "retryable": False,
+                        "attempts": 1,
+                    }
+                ],
+            },
+        )
+    )
+
+    with pytest.raises(A2AInvocationError) as error:
+        await new_client(FakeProvider(client)).invoke(
+            InventoryAgentRequest(
+                sku="ZS-1042",
+                location_id="store-101",
+                correlation_id=CORRELATION_ID,
+            )
+        )
+
+    assert error.value.code == "SPECIALIST_TASK_FAILED"
+    assert error.value.task_state == "TASK_STATE_FAILED"
+    assert error.value.remote_error_code == "AGENT_DEPENDENCY_FAILURE"
+    assert (
+        error.value.remote_error_message
+        == "An inventory dependency failed before a valid assessment was available."
+    )
+    assert error.value.dependency_error_codes == ("MCP_CLIENT_ERROR",)
+    assert len(error.value.agent_errors) == 1
+    assert error.value.agent_errors[0].model_dump() == {
+        "code": "MCP_CLIENT_ERROR",
+        "message": "The Inventory MCP request failed.",
+        "step": "assess_inventory",
+        "retryable": False,
+        "attempts": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("message", "details", "extra_fields"),
+    [
+        (
+            "An inventory dependency failed before a valid assessment was available.",
+            {
+                "dependency_error_codes": ["MCP_CLIENT_ERROR"],
+                "agent_errors": [
+                    {
+                        "code": "MCP_CLIENT_ERROR",
+                        "message": "The Inventory MCP request failed.",
+                        "step": "assess_inventory",
+                        "retryable": False,
+                        "attempts": "1",
+                    }
+                ],
+            },
+            None,
+        ),
+        (
+            "An inventory dependency failed before a valid assessment was available.",
+            {"connection_string": "postgresql://user:secret@db"},
+            None,
+        ),
+        (
+            "password=not-safe",
+            None,
+            None,
+        ),
+        (
+            "An inventory dependency failed before a valid assessment was available.",
+            None,
+            {"stack_trace": "Traceback with internal details"},
+        ),
+        (
+            "An inventory dependency failed before a valid assessment was available.",
+            {"dependency_error_codes": ["PASSWORD_EXPOSED"]},
+            None,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_failed_task_discards_malformed_or_sensitive_error_details(
+    message: str,
+    details: dict[str, Any] | None,
+    extra_fields: dict[str, Any] | None,
+) -> None:
+    client = FakeClient(
+        task_with_error(
+            state=TaskState.TASK_STATE_FAILED,
+            message=message,
+            details=details,
+            extra_fields=extra_fields,
+        )
+    )
+
+    with pytest.raises(A2AInvocationError) as error:
+        await new_client(FakeProvider(client)).invoke(
+            InventoryAgentRequest(
+                sku="ZS-1042",
+                location_id="store-101",
+                correlation_id=CORRELATION_ID,
+            )
+        )
+
+    assert error.value.code == "SPECIALIST_TASK_FAILED"
+    assert error.value.remote_error is None
+    assert error.value.remote_error_code is None
+    assert "secret" not in str(error.value).lower()
+    assert "traceback" not in str(error.value).lower()
+
+
+def _transfer_payload() -> dict[str, Any]:
+    result = inventory_result().model_dump(mode="json", exclude_none=False)
+    result["transfer_candidates"] = {
+        "sku": "ZS-1042",
+        "destination_id": "store-101",
+        "candidates": [
+            {
+                "origin_id": "warehouse-1",
+                "destination_id": "store-101",
+                "origin_location_type": "warehouse",
+                "eligible": True,
+                "transit_days": 2,
+                "donor_position": {
+                    "sku": "ZS-1042",
+                    "location_id": "warehouse-1",
+                    "on_hand": 90,
+                    "reserved": 10,
+                    "reorder_point": 12,
+                    "days_until_stockout": None,
+                    "available_quantity": 80,
+                    "issues": [],
+                },
+                "issues": [],
+            }
+        ],
+    }
+    return result
+
+
+@pytest.mark.asyncio
+async def test_complete_transfer_candidate_and_donor_evidence_are_preserved() -> None:
+    payload = _transfer_payload()
+    expected = InventoryAgentResult.model_validate(payload)
+    invocation = await new_client(
+        FakeProvider(FakeClient(task_with_result_payload(payload)))
+    ).invoke(
+        InventoryAgentRequest(
+            sku="ZS-1042",
+            location_id="store-101",
+            correlation_id=CORRELATION_ID,
+        )
+    )
+
+    assert invocation.result == expected
+    assert invocation.result.transfer_candidates is not None
+    candidate = invocation.result.transfer_candidates.candidates[0]
+    assert candidate.origin_id == "warehouse-1"
+    assert candidate.eligible is True
+    assert candidate.donor_position is not None
+    assert candidate.donor_position.available_quantity == 80
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        ("assessment", "sku", "OTHER-SKU"),
+        ("assessment", "location_id", "store-999"),
+        ("position", "sku", "OTHER-SKU"),
+        ("position", "location_id", "store-999"),
+        ("policy", "sku", "OTHER-SKU"),
+        ("policy", "location_id", "store-999"),
+        ("inbound_inventory", "sku", "OTHER-SKU"),
+        ("inbound_inventory", "location_id", "store-999"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_assessment_rejects_each_nested_scope_mismatch(
+    section: str,
+    field: str,
+    value: str,
+) -> None:
+    payload = inventory_result().model_dump(mode="json", exclude_none=False)
+    assessment = payload["assessment"]
+    if section == "assessment":
+        assessment[field] = value
+    elif section == "position":
+        assessment["position"][field] = value
+    elif section == "policy":
+        assessment["policy"] = {
+            "sku": "ZS-1042",
+            "location_id": "store-101",
+            "target_stock": 48,
+            "safety_stock": 8,
+        }
+        assessment["policy"][field] = value
+    else:
+        assessment["inbound_inventory"][0][field] = value
+
+    with pytest.raises(A2AInvocationError) as error:
+        await new_client(
+            FakeProvider(FakeClient(task_with_result_payload(payload)))
+        ).invoke(
+            InventoryAgentRequest(
+                sku="ZS-1042",
+                location_id="store-101",
+                correlation_id=CORRELATION_ID,
+            )
+        )
+
+    assert error.value.code == "MALFORMED_A2A_RESPONSE"
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        ("inbound_result", "sku", "OTHER-SKU"),
+        ("inbound_result", "location_id", "store-999"),
+        ("item", "sku", "OTHER-SKU"),
+        ("item", "location_id", "store-999"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_inbound_lookup_rejects_each_nested_scope_mismatch(
+    section: str,
+    field: str,
+    value: str,
+) -> None:
+    payload = inventory_result(
+        operation="inbound_lookup"
+    ).model_dump(mode="json", exclude_none=False)
+    if section == "inbound_result":
+        payload["inbound_result"][field] = value
+    else:
+        payload["inbound_result"]["items"][0][field] = value
+
+    with pytest.raises(A2AInvocationError) as error:
+        await new_client(
+            FakeProvider(FakeClient(task_with_result_payload(payload)))
+        ).invoke(
+            InventoryAgentRequest(
+                operation="inbound_lookup",
+                sku="ZS-1042",
+                location_id="store-101",
+                correlation_id=CORRELATION_ID,
+            )
+        )
+
+    assert error.value.code == "MALFORMED_A2A_RESPONSE"
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        ("transfer_candidates", "sku", "OTHER-SKU"),
+        ("transfer_candidates", "destination_id", "store-999"),
+        ("candidate", "destination_id", "store-999"),
+        ("donor_position", "sku", "OTHER-SKU"),
+        ("donor_position", "location_id", "store-999"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_transfer_evidence_rejects_each_scope_mismatch(
+    section: str,
+    field: str,
+    value: str,
+) -> None:
+    payload = _transfer_payload()
+    transfers = payload["transfer_candidates"]
+    if section == "transfer_candidates":
+        transfers[field] = value
+    elif section == "candidate":
+        transfers["candidates"][0][field] = value
+    else:
+        transfers["candidates"][0]["donor_position"][field] = value
+
+    with pytest.raises(A2AInvocationError) as error:
+        await new_client(
+            FakeProvider(FakeClient(task_with_result_payload(payload)))
+        ).invoke(
+            InventoryAgentRequest(
+                sku="ZS-1042",
+                location_id="store-101",
+                correlation_id=CORRELATION_ID,
+            )
+        )
+
+    assert error.value.code == "MALFORMED_A2A_RESPONSE"
 
 
 @pytest.mark.parametrize(
