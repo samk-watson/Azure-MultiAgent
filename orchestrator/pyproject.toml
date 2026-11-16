@@ -12,6 +12,8 @@ dependencies = [
     "azure-multiagent-inventory-contracts==0.1.0",
     "httpx>=0.27,<1",
     "langgraph==1.2.4",
+    "langgraph-checkpoint==4.3.2",
+    "langgraph-checkpoint-postgres==3.2.1",
 ]
 
 [project.optional-dependencies]
@@ -29,6 +31,7 @@ where = ["src"]
 
 [project.scripts]
 supply-chain-orchestrator = "supply_chain_orchestrator.runner:main"
+supply-chain-orchestrator-checkpoint-bootstrap = "supply_chain_orchestrator.checkpointing:bootstrap_main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
