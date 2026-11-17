@@ -19,6 +19,8 @@ from a2a.types import (
     Artifact,
     CancelTaskRequest,
     GetTaskRequest,
+    Message,
+    Role,
     SendMessageRequest,
     StreamResponse,
     Task,
@@ -241,10 +243,12 @@ class FakeClient:
         *,
         poll_tasks: list[Task] | None = None,
         send_error: BaseException | None = None,
+        message_response: Message | None = None,
     ) -> None:
         self.initial_task = initial_task
         self.poll_tasks = list(poll_tasks or [])
         self.send_error = send_error
+        self.message_response = message_response
         self.send_requests: list[SendMessageRequest] = []
         self.get_requests: list[GetTaskRequest] = []
         self.cancel_requests: list[CancelTaskRequest] = []
@@ -256,6 +260,9 @@ class FakeClient:
         self.send_requests.append(request)
         if self.send_error is not None:
             raise self.send_error
+        if self.message_response is not None:
+            yield StreamResponse(message=self.message_response)
+            return
         if self.initial_task is not None:
             yield StreamResponse(task=self.initial_task)
 
@@ -485,6 +492,67 @@ async def test_exact_inventory_request_and_terminal_result_are_preserved(
     assert invocation.correlation_id == CORRELATION_ID
     assert invocation.result == result
     assert not client.get_requests
+    assert provider.closed == 2
+
+
+@pytest.mark.asyncio
+async def test_submit_retrieve_and_cancel_operations_are_independent() -> None:
+    submitted_task = task_with_result(inventory_result())
+    client = FakeClient(
+        submitted_task,
+        poll_tasks=[task_with_result(inventory_result())],
+    )
+    provider = FakeProvider(client)
+    a2a_client = new_client(provider)
+    request = InventoryAgentRequest(
+        sku="ZS-1042",
+        location_id="store-101",
+        correlation_id=CORRELATION_ID,
+    )
+
+    submitted = await a2a_client.submit_once(request)
+    assert submitted.task_id == TASK_ID
+    assert len(client.send_requests) == 1
+    assert not client.get_requests
+
+    invocation = await a2a_client.retrieve_existing_task(
+        request,
+        submitted.task_id,
+    )
+    assert invocation.task_id == TASK_ID
+    assert len(client.get_requests) == 1
+    assert len(client.send_requests) == 1
+
+    state = await a2a_client.cancel_known_task(request, submitted.task_id)
+    assert state == "TASK_STATE_CANCELED"
+    assert [item.id for item in client.cancel_requests] == [TASK_ID]
+    assert len(client.send_requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_rejects_direct_message_without_fabricating_task_id() -> None:
+    client = FakeClient(
+        message_response=Message(
+            message_id="direct-reply",
+            role=Role.ROLE_AGENT,
+            parts=[new_data_part({"status": "accepted"}, media_type="application/json")],
+        )
+    )
+    provider = FakeProvider(client)
+    a2a_client = new_client(provider)
+
+    with pytest.raises(A2AInvocationError) as error:
+        await a2a_client.submit_once(
+            InventoryAgentRequest(
+                sku="ZS-1042",
+                location_id="store-101",
+                correlation_id=CORRELATION_ID,
+            )
+        )
+
+    assert error.value.code == "MALFORMED_A2A_RESPONSE"
+    assert error.value.task_id is None
+    assert len(client.send_requests) == 1
     assert provider.closed == 1
 
 
@@ -1052,7 +1120,7 @@ async def test_external_cancellation_requests_remote_task_cancel() -> None:
         await invocation
 
     assert [request.id for request in client.cancel_requests] == [TASK_ID]
-    assert provider.closed == 1
+    assert provider.closed == 3
 
 
 @pytest.mark.asyncio

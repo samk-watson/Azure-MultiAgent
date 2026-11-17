@@ -877,68 +877,121 @@ class WorkflowLedger:
             workflow = self._select_workflow(
                 connection, workflow_uuid, for_update=True
             )
-            if workflow.lifecycle_state in _TERMINAL_DISPATCH_STATES:
-                raise LedgerConflict("Terminal workflows cannot request cancellation")
-            if workflow.cancellation_requested_at is not None:
-                return workflow
-            requested_lifecycle = "CANCELLATION_REQUESTED"
-            connection.execute(
-                f"""
-                UPDATE {LEDGER_SCHEMA}.workflow_ledger
-                SET lifecycle_state = %s,
-                    cancellation_requested_at = clock_timestamp(),
-                    cancellation_completed_at = NULL,
-                    updated_at = clock_timestamp()
-                WHERE workflow_id = %s
-                """,
-                (requested_lifecycle, workflow_uuid),
+            return self._persist_cancellation_request(
+                connection,
+                workflow,
+                actor_id=actor_id,
             )
-            attempt = connection.execute(
-                f"""
-                UPDATE {LEDGER_SCHEMA}.dispatch_attempts
-                SET cancellation_requested_at = clock_timestamp(),
-                    updated_at = clock_timestamp()
-                WHERE workflow_id = %s
-                  AND dispatch_state IN ('INTENT_COMMITTED', 'SUBMISSION_UNKNOWN', 'TASK_RECORDED')
-                RETURNING attempt_id, dispatch_state, fencing_token, task_id
-                """,
-                (workflow_uuid,),
-            ).fetchone()
+
+    def request_task_cancellation(
+        self,
+        workflow_id: UUID | str,
+        attempt_id: UUID | str,
+        task_id: str,
+        *,
+        owner_id: str,
+        fencing_token: int,
+        actor_id: str,
+    ) -> WorkflowRecord:
+        workflow_uuid = _uuid(workflow_id, "workflow_id")
+        attempt_uuid = _uuid(attempt_id, "attempt_id")
+        owner_id = _validate_owner(owner_id)
+        actor_id = _validate_actor(actor_id)
+        if not isinstance(task_id, str) or not 1 <= len(task_id) <= 512:
+            raise ValueError("task_id must contain between 1 and 512 characters")
+
+        with self._connection() as connection:
+            self._require_migrations(connection)
+            workflow = self._select_workflow(
+                connection, workflow_uuid, for_update=True
+            )
+            attempt = self._owned_attempt(
+                connection,
+                workflow_uuid,
+                attempt_uuid,
+                owner_id,
+                fencing_token,
+            )
+            if attempt[0] != "TASK_RECORDED" or attempt[4] != task_id:
+                raise LedgerConflict(
+                    "Cancellation requires the matching durable task ID for this attempt"
+                )
+            return self._persist_cancellation_request(
+                connection,
+                workflow,
+                actor_id=actor_id,
+            )
+
+    def _persist_cancellation_request(
+        self,
+        connection: Connection[object],
+        workflow: WorkflowRecord,
+        *,
+        actor_id: str,
+    ) -> WorkflowRecord:
+        workflow_uuid = workflow.workflow_id
+        if workflow.lifecycle_state in _TERMINAL_DISPATCH_STATES:
+            raise LedgerConflict("Terminal workflows cannot request cancellation")
+        if workflow.cancellation_requested_at is not None:
+            return workflow
+        requested_lifecycle = "CANCELLATION_REQUESTED"
+        connection.execute(
+            f"""
+            UPDATE {LEDGER_SCHEMA}.workflow_ledger
+            SET lifecycle_state = %s,
+                cancellation_requested_at = clock_timestamp(),
+                cancellation_completed_at = NULL,
+                updated_at = clock_timestamp()
+            WHERE workflow_id = %s
+            """,
+            (requested_lifecycle, workflow_uuid),
+        )
+        attempt = connection.execute(
+            f"""
+            UPDATE {LEDGER_SCHEMA}.dispatch_attempts
+            SET cancellation_requested_at = clock_timestamp(),
+                updated_at = clock_timestamp()
+            WHERE workflow_id = %s
+              AND dispatch_state IN ('INTENT_COMMITTED', 'SUBMISSION_UNKNOWN', 'TASK_RECORDED')
+            RETURNING attempt_id, dispatch_state, fencing_token, task_id
+            """,
+            (workflow_uuid,),
+        ).fetchone()
+        self._audit(
+            connection,
+            workflow_id=workflow_uuid,
+            attempt_id=attempt[0] if attempt else None,
+            actor_id=actor_id,
+            event_type="cancellation_requested",
+            from_lifecycle_state=workflow.lifecycle_state,
+            to_lifecycle_state=requested_lifecycle,
+            from_dispatch_state=workflow.dispatch_state,
+            to_dispatch_state=workflow.dispatch_state,
+            fencing_token=attempt[2] if attempt else None,
+            task_id=attempt[3] if attempt else None,
+        )
+        if workflow.lifecycle_state == "CREATED":
             self._audit(
                 connection,
                 workflow_id=workflow_uuid,
-                attempt_id=attempt[0] if attempt else None,
                 actor_id=actor_id,
-                event_type="cancellation_requested",
-                from_lifecycle_state=workflow.lifecycle_state,
-                to_lifecycle_state=requested_lifecycle,
-                from_dispatch_state=workflow.dispatch_state,
-                to_dispatch_state=workflow.dispatch_state,
-                fencing_token=attempt[2] if attempt else None,
-                task_id=attempt[3] if attempt else None,
+                event_type="workflow_cancelled_before_dispatch",
+                from_lifecycle_state="CANCELLATION_REQUESTED",
+                to_lifecycle_state="CANCELLED",
+                from_dispatch_state="NOT_STARTED",
+                to_dispatch_state="NOT_STARTED",
             )
-            if workflow.lifecycle_state == "CREATED":
-                self._audit(
-                    connection,
-                    workflow_id=workflow_uuid,
-                    actor_id=actor_id,
-                    event_type="workflow_cancelled_before_dispatch",
-                    from_lifecycle_state="CANCELLATION_REQUESTED",
-                    to_lifecycle_state="CANCELLED",
-                    from_dispatch_state="NOT_STARTED",
-                    to_dispatch_state="NOT_STARTED",
-                )
-                connection.execute(
-                    f"""
-                    UPDATE {LEDGER_SCHEMA}.workflow_ledger
-                    SET lifecycle_state = 'CANCELLED',
-                        cancellation_completed_at = clock_timestamp(),
-                        updated_at = clock_timestamp()
-                    WHERE workflow_id = %s
-                    """,
-                    (workflow_uuid,),
-                )
-            return self._select_workflow(connection, workflow_uuid)
+            connection.execute(
+                f"""
+                UPDATE {LEDGER_SCHEMA}.workflow_ledger
+                SET lifecycle_state = 'CANCELLED',
+                    cancellation_completed_at = clock_timestamp(),
+                    updated_at = clock_timestamp()
+                WHERE workflow_id = %s
+                """,
+                (workflow_uuid,),
+            )
+        return self._select_workflow(connection, workflow_uuid)
 
     def finish_attempt(
         self,

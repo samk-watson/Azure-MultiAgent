@@ -92,11 +92,29 @@ workflow, attempt, and task ID are idempotent even when reported by different
 actors; a PostgreSQL primary key enforces this, and migration
 `002_late_task_observations.sql` backfills observation keys while retaining
 existing audit rows. Cancellation intent and timestamps are ledgered
-independently of the external A2A cancellation action.
+independently of the external A2A cancellation action. A task may be cancelled
+only when its ID already matches the durable ID for that workflow and attempt,
+and the caller still owns the active lease and fencing token. An unknown
+submission must first receive an audited `TASK_FOUND` operator resolution;
+cancellation cannot attach a caller-supplied ID or bypass that resolution.
 
-The existing Orchestrator CLI remains unchanged and is not yet wired to ledger
-creation, checkpoint resume, or workflow recovery. Retail tables are not part
-of this database and are never modified by the ledger.
+`LedgerDispatchCoordinator.start` commits the dispatch claim before calling
+`InventoryA2AClient.submit_once`; it records the returned task ID against that
+attempt before any retrieval or polling. A timeout or ambiguous submit with no
+durable task ID transitions to `SUBMISSION_UNKNOWN`. `recover` only claims an
+expired attempt for reconciliation: it retrieves a recorded task ID, or
+returns the unknown state without resubmitting. A poll timeout keeps a known
+task recorded for a later recovery. The client exposes separate submit-once,
+retrieve-existing-task, and cancel-known-task operations while sharing its
+Agent Card, protocol, and result validation paths. Completed A2A task state
+remains separate from the Inventory business result status.
+A submission response containing a direct `Message` without a task ID is
+treated as an unknown outcome and is not automatically retried.
+
+The existing Orchestrator CLI is not wired to dispatch coordination, checkpoint
+resume, or workflow recovery; those entry points remain for a later milestone.
+Retail tables are not part of this database and are never modified by the
+ledger or coordinator.
 
 The Inventory endpoint defaults to `http://127.0.0.1:8001`. Only IPv4/IPv6
 loopback endpoints and `localhost` resolving exclusively to loopback addresses

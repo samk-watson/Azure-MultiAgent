@@ -272,6 +272,13 @@ class InventoryInvocation:
     result: InventoryAgentResult
 
 
+@dataclass(frozen=True)
+class SubmittedTask:
+    task_id: str
+    task_state: str
+    initial_task: Task
+
+
 class A2AClientProtocol(Protocol):
     def send_message(
         self,
@@ -483,12 +490,10 @@ class InventoryA2AClient:
             request_timeout_seconds=self.settings.request_timeout_seconds
         )
 
-    async def invoke(
-        self, request: InventoryAgentRequest
-    ) -> InventoryInvocation:
+    def _specialist_for(self, request: InventoryAgentRequest) -> SpecialistSpec:
         specialist = self.registry.get("inventory")
         try:
-            skill_id = specialist.skill_for(request.operation)
+            specialist.skill_for(request.operation)
         except ValueError as exc:
             raise A2AInvocationError(
                 code="UNSUPPORTED_OPERATION",
@@ -496,89 +501,85 @@ class InventoryA2AClient:
                 specialist_id=specialist.specialist_id,
                 correlation_id=request.correlation_id,
             ) from exc
+        return specialist
 
-        task_id: str | None = None
-        task_state: str | None = None
-        active_client: A2AClientProtocol | None = None
-        stage = "discovery"
+    @asynccontextmanager
+    async def _open_session(
+        self, request: InventoryAgentRequest
+    ) -> AsyncIterator[tuple[SpecialistSpec, A2ASession]]:
+        specialist = self._specialist_for(request)
+        skill_id = specialist.skill_for(request.operation)
+        async with self.session_provider.open(specialist) as session:
+            try:
+                validate_agent_card(specialist, session.card)
+            except ValueError as exc:
+                raise AgentCardValidationError from exc
+            if skill_id not in {skill.id for skill in session.card.skills}:
+                raise AgentCardValidationError(
+                    "Agent Card does not advertise the required skill"
+                )
+            yield specialist, session
+
+    @staticmethod
+    def _translate_error(
+        error: BaseException,
+        *,
+        stage: Literal["discovery", "submission", "polling", "cancellation"],
+        specialist: SpecialistSpec,
+        request: InventoryAgentRequest,
+        task_id: str | None = None,
+        task_state: str | None = None,
+    ) -> A2AInvocationError:
+        if isinstance(error, (TimeoutError, httpx.TimeoutException, A2AClientTimeoutError)):
+            if stage == "submission":
+                code = "SUBMISSION_OUTCOME_UNKNOWN"
+                message = "Inventory task submission timed out before its task ID was received."
+            elif stage == "discovery":
+                code = "AGENT_DISCOVERY_TIMEOUT"
+                message = "Inventory Agent Card discovery timed out."
+            else:
+                code = "TASK_TIMEOUT"
+                message = "Inventory task did not reach a terminal state before the deadline."
+        elif isinstance(error, (A2AClientError, httpx.RequestError, OSError)):
+            if stage == "discovery":
+                code = "AGENT_UNAVAILABLE"
+                message = "Inventory Agent is unavailable."
+            elif stage == "submission" and _has_transport_cause(error):
+                code = "SUBMISSION_OUTCOME_UNKNOWN"
+                message = "Inventory task submission may have been accepted, but no task ID was received."
+            else:
+                code = "A2A_REQUEST_FAILED"
+                message = "Inventory A2A communication failed."
+        else:
+            code = "MALFORMED_A2A_RESPONSE"
+            message = "Inventory Agent returned an invalid A2A response."
+        return A2AInvocationError(
+            code=code,
+            message=message,
+            specialist_id=specialist.specialist_id,
+            correlation_id=request.correlation_id,
+            task_id=task_id,
+            task_state=task_state,
+        )
+
+    async def submit_once(
+        self, request: InventoryAgentRequest
+    ) -> SubmittedTask:
+        specialist = self._specialist_for(request)
+        stage: Literal["discovery", "submission", "polling", "cancellation"] = "discovery"
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.settings.task_timeout_seconds
-
         try:
             async with asyncio.timeout(self.settings.task_timeout_seconds):
-                async with self.session_provider.open(specialist) as session:
-                    try:
-                        validate_agent_card(specialist, session.card)
-                    except ValueError as exc:
-                        raise A2AInvocationError(
-                            code="INVALID_AGENT_CARD",
-                            message="The Inventory Agent Card is incompatible with the configured specialist.",
-                            specialist_id=specialist.specialist_id,
-                            correlation_id=request.correlation_id,
-                        ) from exc
-                    if skill_id not in {skill.id for skill in session.card.skills}:
-                        raise A2AInvocationError(
-                            code="INVALID_AGENT_CARD",
-                            message="The Inventory Agent Card does not advertise the required skill.",
-                            specialist_id=specialist.specialist_id,
-                            correlation_id=request.correlation_id,
-                        )
-                    active_client = session.client
-                    try:
-                        stage = "submission"
-                        task = await self._submit(
-                            session.client,
-                            request,
-                            deadline,
-                        )
-                        task_id = task.id
-                        task_state = _state_name(task.status.state)
-                        self._validate_task_identity(task, task_id)
-
-                        while task.status.state in _POLLABLE_STATES:
-                            stage = "polling"
-                            remaining = deadline - loop.time()
-                            if remaining <= 0:
-                                raise TimeoutError
-                            await asyncio.sleep(
-                                min(self.settings.poll_interval_seconds, remaining)
-                            )
-                            task = await session.client.get_task(
-                                GetTaskRequest(id=task_id),
-                                context=self._call_context(deadline),
-                            )
-                            self._validate_task_identity(task, task_id)
-                            task_state = _state_name(task.status.state)
-
-                        task_state = _state_name(task.status.state)
-                        return self._result_from_terminal_task(
-                            task,
-                            specialist,
-                            request,
-                            task_state,
-                        )
-                    except asyncio.CancelledError:
-                        if task_id is not None:
-                            await self._cancel_best_effort(
-                                session_client=active_client,
-                                task_id=task_id,
-                                deadline=loop.time()
-                                + self.settings.cancel_timeout_seconds,
-                            )
-                        raise
-                    except (
-                        TimeoutError,
-                        httpx.TimeoutException,
-                        A2AClientTimeoutError,
-                    ):
-                        if task_id is not None:
-                            await self._cancel_best_effort(
-                                session_client=active_client,
-                                task_id=task_id,
-                                deadline=loop.time()
-                                + self.settings.cancel_timeout_seconds,
-                            )
-                        raise
+                async with self._open_session(request) as (_, session):
+                    stage = "submission"
+                    task = await self._submit(session.client, request, deadline)
+                    self._validate_task_identity(task, task.id)
+                    return SubmittedTask(
+                        task_id=task.id,
+                        task_state=_state_name(task.status.state),
+                        initial_task=task,
+                    )
         except asyncio.CancelledError:
             raise
         except A2AInvocationError:
@@ -591,55 +592,206 @@ class InventoryA2AClient:
                 correlation_id=request.correlation_id,
             ) from exc
         except (TimeoutError, httpx.TimeoutException, A2AClientTimeoutError) as exc:
-            if stage == "submission" and task_id is None:
-                code = "SUBMISSION_OUTCOME_UNKNOWN"
-                message = "Inventory task submission timed out before its task ID was received."
-            elif stage == "polling" or task_id is not None:
-                code = "TASK_TIMEOUT"
-                message = "Inventory task did not reach a terminal state before the deadline."
-            else:
-                code = "AGENT_DISCOVERY_TIMEOUT"
-                message = "Inventory Agent Card discovery timed out."
+            raise self._translate_error(
+                exc, stage=stage, specialist=specialist, request=request
+            ) from exc
+        except (A2AClientError, httpx.RequestError, OSError) as exc:
+            raise self._translate_error(
+                exc, stage=stage, specialist=specialist, request=request
+            ) from exc
+        except (ValueError, TypeError, KeyError) as exc:
+            raise self._translate_error(
+                exc, stage=stage, specialist=specialist, request=request
+            ) from exc
+
+    async def retrieve_existing_task(
+        self,
+        request: InventoryAgentRequest,
+        task_id: str,
+        *,
+        initial_task: Task | None = None,
+        timeout_seconds: float | None = None,
+    ) -> InventoryInvocation:
+        if not isinstance(task_id, str) or not 1 <= len(task_id) <= 512:
+            raise ValueError("task_id must contain between 1 and 512 characters")
+        timeout = (
+            self.settings.task_timeout_seconds
+            if timeout_seconds is None
+            else timeout_seconds
+        )
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        specialist = self._specialist_for(request)
+        stage: Literal["discovery", "submission", "polling", "cancellation"] = "discovery"
+        task_state: str | None = None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        try:
+            async with asyncio.timeout(timeout):
+                async with self._open_session(request) as (_, session):
+                    stage = "polling"
+                    task = initial_task
+                    if task is None:
+                        task = await session.client.get_task(
+                            GetTaskRequest(id=task_id),
+                            context=self._call_context(deadline),
+                        )
+                    self._validate_task_identity(task, task_id)
+                    task_state = _state_name(task.status.state)
+                    while task.status.state in _POLLABLE_STATES:
+                        remaining = deadline - loop.time()
+                        if remaining <= 0:
+                            raise TimeoutError
+                        await asyncio.sleep(
+                            min(self.settings.poll_interval_seconds, remaining)
+                        )
+                        task = await session.client.get_task(
+                            GetTaskRequest(id=task_id),
+                            context=self._call_context(deadline),
+                        )
+                        self._validate_task_identity(task, task_id)
+                        task_state = _state_name(task.status.state)
+                    return self._result_from_terminal_task(
+                        task, specialist, request, task_state
+                    )
+        except asyncio.CancelledError:
+            raise
+        except A2AInvocationError:
+            raise
+        except AgentCardValidationError as exc:
             raise A2AInvocationError(
-                code=code,
-                message=message,
+                code="INVALID_AGENT_CARD",
+                message="The Inventory Agent Card is incompatible with the configured specialist.",
                 specialist_id=specialist.specialist_id,
                 correlation_id=request.correlation_id,
+                task_id=task_id,
+                task_state=task_state,
+            ) from exc
+        except (TimeoutError, httpx.TimeoutException, A2AClientTimeoutError) as exc:
+            raise self._translate_error(
+                exc,
+                stage=stage,
+                specialist=specialist,
+                request=request,
                 task_id=task_id,
                 task_state=task_state,
             ) from exc
         except (A2AClientError, httpx.RequestError, OSError) as exc:
-            if stage == "discovery":
-                code = "AGENT_UNAVAILABLE"
-                message = "Inventory Agent is unavailable."
-            elif (
-                stage == "submission"
-                and task_id is None
-                and _has_transport_cause(exc)
-            ):
-                code = "SUBMISSION_OUTCOME_UNKNOWN"
-                message = "Inventory task submission may have been accepted, but no task ID was received."
-            else:
-                code = "A2A_REQUEST_FAILED"
-                message = "Inventory A2A communication failed."
-            raise A2AInvocationError(
-                code=code,
-                message=message,
-                specialist_id=specialist.specialist_id,
-                correlation_id=request.correlation_id,
+            raise self._translate_error(
+                exc,
+                stage=stage,
+                specialist=specialist,
+                request=request,
                 task_id=task_id,
                 task_state=task_state,
             ) from exc
         except (ValueError, TypeError, KeyError) as exc:
-            code = "MALFORMED_A2A_RESPONSE"
-            raise A2AInvocationError(
-                code=code,
-                message="Inventory Agent returned an invalid A2A response.",
-                specialist_id=specialist.specialist_id,
-                correlation_id=request.correlation_id,
+            raise self._translate_error(
+                exc,
+                stage=stage,
+                specialist=specialist,
+                request=request,
                 task_id=task_id,
                 task_state=task_state,
             ) from exc
+
+    async def cancel_known_task(
+        self,
+        request: InventoryAgentRequest,
+        task_id: str,
+    ) -> str:
+        if not isinstance(task_id, str) or not 1 <= len(task_id) <= 512:
+            raise ValueError("task_id must contain between 1 and 512 characters")
+        specialist = self._specialist_for(request)
+        stage: Literal["discovery", "submission", "polling", "cancellation"] = "discovery"
+        deadline = asyncio.get_running_loop().time() + self.settings.cancel_timeout_seconds
+        try:
+            async with asyncio.timeout(self.settings.cancel_timeout_seconds):
+                async with self._open_session(request) as (_, session):
+                    stage = "cancellation"
+                    task = await session.client.cancel_task(
+                        CancelTaskRequest(id=task_id),
+                        context=self._call_context(deadline),
+                    )
+                    self._validate_task_identity(task, task_id)
+                    return _state_name(task.status.state)
+        except asyncio.CancelledError:
+            raise
+        except A2AInvocationError:
+            raise
+        except AgentCardValidationError as exc:
+            raise A2AInvocationError(
+                code="INVALID_AGENT_CARD",
+                message="The Inventory Agent Card is incompatible with the configured specialist.",
+                specialist_id=specialist.specialist_id,
+                correlation_id=request.correlation_id,
+                task_id=task_id,
+            ) from exc
+        except (TimeoutError, httpx.TimeoutException, A2AClientTimeoutError) as exc:
+            raise self._translate_error(
+                exc,
+                stage=stage,
+                specialist=specialist,
+                request=request,
+                task_id=task_id,
+            ) from exc
+        except (A2AClientError, httpx.RequestError, OSError) as exc:
+            raise self._translate_error(
+                exc,
+                stage=stage,
+                specialist=specialist,
+                request=request,
+                task_id=task_id,
+            ) from exc
+        except (ValueError, TypeError, KeyError) as exc:
+            raise self._translate_error(
+                exc,
+                stage=stage,
+                specialist=specialist,
+                request=request,
+                task_id=task_id,
+            ) from exc
+
+    async def invoke(
+        self, request: InventoryAgentRequest
+    ) -> InventoryInvocation:
+        deadline = asyncio.get_running_loop().time() + self.settings.task_timeout_seconds
+        submitted = await self.submit_once(request)
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            error = A2AInvocationError(
+                code="TASK_TIMEOUT",
+                message="Inventory task did not reach a terminal state before the deadline.",
+                specialist_id=self.registry.get("inventory").specialist_id,
+                correlation_id=request.correlation_id,
+                task_id=submitted.task_id,
+                task_state=submitted.task_state,
+            )
+            await self._cancel_best_effort(
+                request=request,
+                task_id=submitted.task_id,
+            )
+            raise error
+        try:
+            return await self.retrieve_existing_task(
+                request,
+                submitted.task_id,
+                initial_task=submitted.initial_task,
+                timeout_seconds=remaining,
+            )
+        except asyncio.CancelledError:
+            await self._cancel_best_effort(
+                request=request,
+                task_id=submitted.task_id,
+            )
+            raise
+        except A2AInvocationError as exc:
+            if exc.code == "TASK_TIMEOUT":
+                await self._cancel_best_effort(
+                    request=request,
+                    task_id=submitted.task_id,
+                )
+            raise
 
     async def _submit(
         self,
@@ -822,19 +974,13 @@ class InventoryA2AClient:
     async def _cancel_best_effort(
         self,
         *,
-        session_client: A2AClientProtocol | None,
+        request: InventoryAgentRequest,
         task_id: str,
-        deadline: float,
     ) -> None:
-        if session_client is None:
-            return
         try:
             async with asyncio.timeout(self.settings.cancel_timeout_seconds):
-                await session_client.cancel_task(
-                    CancelTaskRequest(id=task_id),
-                    context=self._call_context(deadline),
-                )
-        except (TimeoutError, httpx.RequestError, A2AClientError, OSError) as exc:
+                await self.cancel_known_task(request, task_id)
+        except (TimeoutError, A2AInvocationError) as exc:
             logger.warning(
                 "Could not confirm cancellation of Inventory A2A task %s (%s)",
                 task_id,
