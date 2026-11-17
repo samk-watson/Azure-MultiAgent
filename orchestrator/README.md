@@ -67,9 +67,36 @@ privileges, not runtime configuration; do not use it as the Orchestrator
 checkpoint URL. The synthetic retail database is not the application retail
 database.
 
-This milestone establishes the saver and isolated database foundation only.
-It does not wire durable workflows into the CLI, add a lifecycle ledger, or
-provide resume/recovery semantics. Retail tables are not part of this database.
+The Orchestrator lifecycle ledger is stored in the separate
+`orchestrator_control` schema in the same dedicated database. It has its own
+versioned migration history and tables for workflow metadata, dispatch
+attempts, and audit events; it does not store full Inventory evidence. Apply
+these migrations explicitly after checkpoint bootstrap:
+
+```powershell
+supply-chain-orchestrator-ledger-bootstrap
+```
+
+`WorkflowLedger.create_workflow` is idempotent for a stable workflow ID and
+request hash; reusing an ID with a different request hash is rejected.
+`claim_dispatch` commits `INTENT_COMMITTED`, an attempt ID, owner lease, and
+fencing token before returning. A caller may send an A2A request only after
+that commit, and this ledger does not send requests itself. Expired claims can
+only be taken over for reconciliation; the returned claim explicitly forbids
+dispatch. Ambiguous submissions require an audited operator resolution and
+are never automatically resubmitted. If a task ID arrives after an operator
+confirmed that submission did not occur, `record_late_task_id` appends one
+audit observation per distinct task ID without changing the resolution,
+workflow state, or dispatch eligibility. Repeated observations of the same
+workflow, attempt, and task ID are idempotent even when reported by different
+actors; a PostgreSQL primary key enforces this, and migration
+`002_late_task_observations.sql` backfills observation keys while retaining
+existing audit rows. Cancellation intent and timestamps are ledgered
+independently of the external A2A cancellation action.
+
+The existing Orchestrator CLI remains unchanged and is not yet wired to ledger
+creation, checkpoint resume, or workflow recovery. Retail tables are not part
+of this database and are never modified by the ledger.
 
 The Inventory endpoint defaults to `http://127.0.0.1:8001`. Only IPv4/IPv6
 loopback endpoints and `localhost` resolving exclusively to loopback addresses

@@ -29,9 +29,13 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+supply_chain_orchestrator = ["migrations/*.sql"]
+
 [project.scripts]
 supply-chain-orchestrator = "supply_chain_orchestrator.runner:main"
 supply-chain-orchestrator-checkpoint-bootstrap = "supply_chain_orchestrator.checkpointing:bootstrap_main"
+supply-chain-orchestrator-ledger-bootstrap = "supply_chain_orchestrator.ledger:ledger_bootstrap_main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
