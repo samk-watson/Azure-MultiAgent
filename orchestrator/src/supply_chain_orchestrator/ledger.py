@@ -74,6 +74,32 @@ class WorkflowRecord:
 
 
 @dataclass(frozen=True)
+class DispatchAttemptRecord:
+    workflow_id: UUID
+    attempt_id: UUID
+    attempt_number: int
+    dispatch_state: str
+    owner_id: str
+    fencing_token: int
+    lease_expires_at: datetime
+    task_id: str | None
+    error_code: str | None
+    cancellation_requested_at: datetime | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class TerminalEvidence:
+    event_types: tuple[str, ...] = ()
+    task_ids_in_audit: tuple[str, ...] = ()
+    late_task_count: int = 0
+    attempt_count: int = 0
+    operator_reason_code: str | None = None
+
+
+@dataclass(frozen=True)
 class DispatchClaim:
     workflow_id: UUID
     thread_id: UUID
@@ -382,6 +408,80 @@ class WorkflowLedger:
         with self._connection() as connection:
             self._require_migrations(connection)
             return self._select_workflow(connection, workflow_uuid)
+
+    def get_terminal_evidence(self, workflow_id: UUID | str) -> TerminalEvidence:
+        """Read-only audit and late-task evidence used to derive terminal dispositions."""
+        workflow_uuid = _uuid(workflow_id, "workflow_id")
+        with self._connection() as connection:
+            self._require_migrations(connection)
+            events = connection.execute(
+                f"""
+                SELECT event_type, reason_code, task_id
+                FROM {LEDGER_SCHEMA}.workflow_audit
+                WHERE workflow_id = %s
+                ORDER BY audit_id
+                """,
+                (workflow_uuid,),
+            ).fetchall()
+            late = connection.execute(
+                f"""
+                SELECT count(*)
+                FROM {LEDGER_SCHEMA}.late_task_observations
+                WHERE workflow_id = %s
+                """,
+                (workflow_uuid,),
+            ).fetchone()[0]
+            attempts = connection.execute(
+                f"""
+                SELECT count(*)
+                FROM {LEDGER_SCHEMA}.dispatch_attempts
+                WHERE workflow_id = %s
+                """,
+                (workflow_uuid,),
+            ).fetchone()[0]
+        reasons = [row[1] for row in events if row[0] == "operator_confirmed_not_submitted"]
+        return TerminalEvidence(
+            event_types=tuple(row[0] for row in events),
+            task_ids_in_audit=tuple(row[2] for row in events if row[2] is not None),
+            late_task_count=late,
+            attempt_count=attempts,
+            operator_reason_code=reasons[-1] if reasons else None,
+        )
+
+    def get_dispatch_attempt(
+        self, workflow_id: UUID | str
+    ) -> DispatchAttemptRecord | None:
+        workflow_uuid = _uuid(workflow_id, "workflow_id")
+        with self._connection() as connection:
+            self._require_migrations(connection)
+            row = connection.execute(
+                f"""
+                SELECT workflow_id, attempt_id, attempt_number, dispatch_state,
+                       owner_id, fencing_token, lease_expires_at, task_id,
+                       error_code, cancellation_requested_at, created_at,
+                       updated_at, completed_at
+                FROM {LEDGER_SCHEMA}.dispatch_attempts
+                WHERE workflow_id = %s
+                """,
+                (workflow_uuid,),
+            ).fetchone()
+        if row is None:
+            return None
+        return DispatchAttemptRecord(
+            workflow_id=row[0],
+            attempt_id=row[1],
+            attempt_number=row[2],
+            dispatch_state=row[3],
+            owner_id=row[4],
+            fencing_token=row[5],
+            lease_expires_at=row[6],
+            task_id=row[7],
+            error_code=row[8],
+            cancellation_requested_at=row[9],
+            created_at=row[10],
+            updated_at=row[11],
+            completed_at=row[12],
+        )
 
     def claim_dispatch(
         self,
@@ -877,6 +977,26 @@ class WorkflowLedger:
             workflow = self._select_workflow(
                 connection, workflow_uuid, for_update=True
             )
+            # Validated under the workflow lock so it serializes with
+            # record_task_id and resolution of unknown submissions.
+            attempt = connection.execute(
+                f"""
+                SELECT dispatch_state, task_id
+                FROM {LEDGER_SCHEMA}.dispatch_attempts
+                WHERE workflow_id = %s
+                FOR UPDATE
+                """,
+                (workflow_uuid,),
+            ).fetchone()
+            if (
+                attempt is not None
+                and attempt[1] is None
+                and attempt[0] not in {"INTENT_COMMITTED"}
+                and workflow.lifecycle_state not in _TERMINAL_DISPATCH_STATES
+            ):
+                raise LedgerConflict(
+                    "An unknown submission must be resolved as TASK_FOUND before cancellation"
+                )
             return self._persist_cancellation_request(
                 connection,
                 workflow,

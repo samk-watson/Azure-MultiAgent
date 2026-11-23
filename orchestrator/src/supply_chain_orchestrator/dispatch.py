@@ -14,6 +14,7 @@ from supply_chain_orchestrator.a2a_client import (
     SubmittedTask,
 )
 from supply_chain_orchestrator.ledger import (
+    DispatchAttemptRecord,
     DispatchClaim,
     ReconciliationClaim,
     WorkflowLedger,
@@ -209,6 +210,103 @@ class LedgerDispatchCoordinator:
             workflow=workflow,
         )
 
+    async def resume_workflow(
+        self,
+        workflow_id: UUID | str,
+        request: OrchestratorRequest,
+        *,
+        owner_id: str,
+        lease_seconds: int = 60,
+    ) -> DispatchResult:
+        workflow = self.ledger.get_workflow(workflow_id)
+        self._assert_request_matches(workflow, request)
+        attempt = self.ledger.get_dispatch_attempt(workflow.workflow_id)
+        if attempt is None:
+            if workflow.lifecycle_state == "CREATED":
+                return await self.start(
+                    workflow.workflow_id,
+                    request,
+                    owner_id=owner_id,
+                    lease_seconds=lease_seconds,
+                )
+            if workflow.lifecycle_state == "CANCELLED":
+                return DispatchResult(
+                    workflow=workflow,
+                    task_id=None,
+                    task_state="TASK_STATE_CANCELED",
+                )
+            return DispatchResult(
+                workflow=workflow,
+                task_id=None,
+                task_state=None,
+                error_code="SUBMISSION_OUTCOME_UNKNOWN",
+                error_message="Workflow has no dispatch attempt; automatic submission is disabled.",
+            )
+
+        if attempt.dispatch_state in {
+            "INTENT_COMMITTED",
+            "SUBMISSION_UNKNOWN",
+            "TASK_RECORDED",
+        }:
+            return await self.recover(
+                workflow.workflow_id,
+                attempt.attempt_id,
+                owner_id=owner_id,
+                lease_seconds=lease_seconds,
+            )
+        return await self._recover_terminal_attempt(workflow, attempt, request)
+
+    async def _recover_terminal_attempt(
+        self,
+        workflow: WorkflowRecord,
+        attempt: DispatchAttemptRecord,
+        request: OrchestratorRequest,
+    ) -> DispatchResult:
+        if attempt.dispatch_state == "CANCELLED":
+            return DispatchResult(
+                workflow=workflow,
+                task_id=attempt.task_id,
+                task_state="TASK_STATE_CANCELED",
+            )
+        if attempt.error_code == "OPERATOR_CONFIRMED_NOT_SUBMITTED":
+            return DispatchResult(
+                workflow=workflow,
+                task_id=None,
+                task_state=None,
+                error_code="SUBMISSION_OUTCOME_UNKNOWN",
+                error_message=(
+                    "An operator confirmed no task was submitted; automatic "
+                    "submission is disabled."
+                ),
+            )
+        if attempt.task_id is None:
+            return DispatchResult(
+                workflow=workflow,
+                task_id=None,
+                task_state=None,
+                error_code="SUBMISSION_OUTCOME_UNKNOWN",
+                error_message="The terminal dispatch has no task ID; automatic submission is disabled.",
+            )
+        try:
+            invocation = await self.inventory_client.retrieve_existing_task(
+                self._inventory_request(request),
+                attempt.task_id,
+            )
+        except A2AInvocationError as error:
+            return DispatchResult(
+                workflow=workflow,
+                task_id=attempt.task_id,
+                task_state=error.task_state,
+                error_code=error.code,
+                error_message=error.message,
+            )
+        return DispatchResult(
+            workflow=workflow,
+            task_id=invocation.task_id,
+            task_state=invocation.task_state,
+            inventory_invocation=invocation,
+        )
+
     async def cancel(
         self,
         claim: DispatchClaim | ReconciliationClaim,
@@ -287,6 +385,9 @@ class LedgerDispatchCoordinator:
         record = workflow or self.ledger.get_workflow(claim.workflow_id)
         if task_id is None:
             raise ValueError("Dispatch attempt has no durably recorded task ID")
+        if honor_cancellation:
+            # Cancellation intent may have committed after the caller's copy.
+            record = self.ledger.get_workflow(claim.workflow_id)
         try:
             if honor_cancellation and record.cancellation_requested_at is not None:
                 return await self._cancel_recorded_task(
@@ -301,6 +402,8 @@ class LedgerDispatchCoordinator:
                 initial_task=initial_task,
             )
         except A2AInvocationError as error:
+            if honor_cancellation:
+                record = self.ledger.get_workflow(claim.workflow_id)
             if error.task_state in {
                 "TASK_STATE_COMPLETED",
                 "TASK_STATE_FAILED",
@@ -329,6 +432,15 @@ class LedgerDispatchCoordinator:
                 error_message=error.message,
             )
 
+        if honor_cancellation:
+            record = self.ledger.get_workflow(claim.workflow_id)
+            if record.cancellation_requested_at is not None:
+                return await self._cancel_recorded_task(
+                    claim,
+                    request,
+                    task_id,
+                    record,
+                )
         record = self.ledger.finish_attempt(
             claim.workflow_id,
             claim.attempt_id,

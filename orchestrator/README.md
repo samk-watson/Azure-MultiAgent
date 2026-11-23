@@ -111,10 +111,88 @@ remains separate from the Inventory business result status.
 A submission response containing a direct `Message` without a task ID is
 treated as an unknown outcome and is not automatically retried.
 
-The existing Orchestrator CLI is not wired to dispatch coordination, checkpoint
-resume, or workflow recovery; those entry points remain for a later milestone.
-Retail tables are not part of this database and are never modified by the
-ledger or coordinator.
+The CLI supports both the original stateless invocation and explicit durable
+workflow operations. Durable commands use the stable workflow ID as the
+LangGraph thread ID, read the saved request from the ledger on resume, and
+reconcile ledger state before any dispatch recovery. The ledger remains
+authoritative for dispatch attempts, task IDs, operator resolutions, and
+cancellation; checkpoints hold graph progress and validated results. A
+checkpoint/ledger mismatch fails closed. Terminal checkpoints are returned
+without contacting the Inventory Agent, and `inspect` is read-only and makes
+no A2A calls.
+
+Checkpoint and ledger migrations remain explicit; ordinary durable CLI
+commands never run migrations or fall back to in-memory state. After setting
+the checkpoint and retail identity URLs above, bootstrap each store once:
+
+```powershell
+supply-chain-orchestrator-checkpoint-bootstrap
+supply-chain-orchestrator-ledger-bootstrap
+```
+
+Start a durable workflow and retain the returned workflow ID for later
+operations:
+
+```powershell
+$workflowId = [guid]::NewGuid().ToString()
+supply-chain-orchestrator start --sku ZS-1042 --location-id store-101 --workflow-id $workflowId
+supply-chain-orchestrator inspect --workflow-id $workflowId
+supply-chain-orchestrator resume --workflow-id $workflowId
+```
+
+`start` is idempotent for a supplied workflow ID and matching request hash;
+reusing that ID with different request data is rejected. Resume accepts no
+replacement request. After a crash, wait for the attempt lease to expire before
+reconciliation can take ownership; a recovered known task is retrieved by its
+recorded ID and is never resubmitted. Ambiguous submissions remain
+`SUBMISSION_UNKNOWN`, with no automatic retry. Resolve these only after an
+audited operator investigation:
+
+```powershell
+$verifiedTaskId = "task-id-confirmed-by-operator"
+$operatorId = "operator@example"
+supply-chain-orchestrator resolve --workflow-id $workflowId --resolution TASK_FOUND --task-id $verifiedTaskId --reason-code VERIFIED_TASK --actor-id $operatorId
+supply-chain-orchestrator resolve --workflow-id $workflowId --resolution CONFIRMED_NOT_SUBMITTED --reason-code VERIFIED_ABSENCE --actor-id $operatorId
+```
+
+Cancellation of a known task also requires an expired lease so it can claim
+reconciliation ownership; the durable canonical task ID is required, and
+cancellation intent is committed before the A2A cancel request:
+
+```powershell
+$durableTaskId = "task-id-from-inspect"
+supply-chain-orchestrator cancel --workflow-id $workflowId --task-id $durableTaskId --actor-id $operatorId
+```
+
+An unknown submission must first be resolved as `TASK_FOUND` before it can be
+cancelled. While a dispatch is `INTENT_COMMITTED` and no task ID exists yet,
+`cancel` (without `--task-id`) only records cancellation intent; the intent is
+honored through the authorized path once a real task ID becomes durable. Any
+supplied task ID is rejected until then. Terminal workflows cannot be cancelled.
+`resume` on a terminal workflow makes no A2A calls: the checkpoint result must
+reconcile with the ledger (workflow, request hash, correlation, task ID/state,
+status), otherwise a structured `TERMINAL_RECOVERY_INCONSISTENT` result is
+returned and nothing is repaired. `inspect` includes an `attempt` block (ID,
+canonical task ID/state, owner, lease, fencing token, lifecycle timestamps).
+When a terminal workflow has no usable final checkpoint, `resume` derives a
+disposition from ledger evidence only (read-only, no Inventory result, no task
+ID): `CANCELLED_BEFORE_DISPATCH` when the audit trail proves no dispatch intent
+was ever committed; `OPERATOR_CLOSED_NOT_SUBMITTED` for an audited
+`CONFIRMED_NOT_SUBMITTED` resolution, labelled
+`OPERATOR_ASSERTION_NOT_INDEPENDENTLY_VERIFIED` (not verified remote
+non-execution); and `OPERATOR_REVIEW_REQUIRED` if late-task evidence exists.
+Any other inconsistency, or a missing checkpoint for a business outcome,
+returns `TERMINAL_RECOVERY_INCONSISTENT`.
+On Windows, durable CLI commands create a Selector event loop for
+psycopg compatibility. The original stateless CLI flags remain available and
+retain their prior behavior:
+
+```powershell
+supply-chain-orchestrator --operation assess --sku ZS-1042 --location-id store-101
+```
+
+Retail tables are not part of the checkpoint database and are never modified
+by the Orchestrator, lifecycle ledger, or dispatch coordinator.
 
 The Inventory endpoint defaults to `http://127.0.0.1:8001`. Only IPv4/IPv6
 loopback endpoints and `localhost` resolving exclusively to loopback addresses
@@ -145,5 +223,5 @@ task, and full Inventory result evidence. Result states distinguish `complete`,
 `partial`, `business_failed`, `infrastructure_failed`, `cancelled`, and `invalid`.
 Invalid requests are rejected by the graph before an A2A call. A completed
 task's business result is kept distinct from a failed A2A task. The graph
-accepts an optional LangGraph checkpointer; no persistence implementation is
-configured by default.
+accepts an optional LangGraph checkpointer; durable commands use the configured
+PostgreSQL checkpointer.
