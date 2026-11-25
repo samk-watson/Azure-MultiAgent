@@ -18,10 +18,7 @@ from supply_chain_orchestrator.a2a_client import (
     InventoryInvocation,
     SubmittedTask,
 )
-from supply_chain_orchestrator.checkpointing import (
-    bootstrap_checkpoint_database,
-    open_checkpoint_saver,
-)
+from supply_chain_orchestrator.checkpointing import open_checkpoint_saver
 from supply_chain_orchestrator.dispatch import LedgerDispatchCoordinator
 from supply_chain_orchestrator.durable import DurableOrchestrator
 from supply_chain_orchestrator.ledger import LedgerConflict, WorkflowLedger
@@ -36,10 +33,7 @@ def _run(coroutine):
 def ledger() -> WorkflowLedger:
     if not os.environ.get("ORCHESTRATOR_CHECKPOINT_DATABASE_URL"):
         pytest.skip("ORCHESTRATOR_CHECKPOINT_DATABASE_URL is unset.")
-    instance = WorkflowLedger()
-    instance.apply_migrations()
-    _run(bootstrap_checkpoint_database())
-    return instance
+    return WorkflowLedger()
 
 
 def _request() -> OrchestratorRequest:

@@ -15,15 +15,14 @@ from supply_chain_orchestrator.ledger import (
     WorkflowNotFound,
 )
 from supply_chain_orchestrator.models import OrchestratorRequest
+from pg_security import privileged_connect, provision_database
 
 
 @pytest.fixture
 def ledger() -> WorkflowLedger:
     if not os.environ.get("ORCHESTRATOR_CHECKPOINT_DATABASE_URL"):
         pytest.skip("ORCHESTRATOR_CHECKPOINT_DATABASE_URL is unset.")
-    instance = WorkflowLedger()
-    instance.apply_migrations()
-    return instance
+    return WorkflowLedger()
 
 
 def _request(
@@ -55,8 +54,9 @@ def _expire_lease(attempt_id: object) -> None:
 
 def test_ledger_migrations_are_explicit_repeatable_and_separate(
     ledger: WorkflowLedger,
+    tmp_path,
 ) -> None:
-    ledger.apply_migrations()
+    provision_database(tmp_path)
     database_url = os.environ["ORCHESTRATOR_CHECKPOINT_DATABASE_URL"]
 
     with psycopg.connect(database_url) as connection:
@@ -84,12 +84,13 @@ def test_ledger_migrations_are_explicit_repeatable_and_separate(
             FROM orchestrator_control.schema_migrations
             WHERE version IN (
                 '001_workflow_ledger.sql',
-                '002_late_task_observations.sql'
+                '002_late_task_observations.sql',
+                '003_audit_append_only.sql'
             )
             """
         ).fetchone()[0]
         observation_table = connection.execute(
-            "SELECT to_regclass('orchestrator_control.late_task_observations')"
+            "SELECT to_regclass('orchestrator_control.late_task_observations') IS NOT NULL"
         ).fetchone()[0]
 
     assert {
@@ -99,8 +100,8 @@ def test_ledger_migrations_are_explicit_repeatable_and_separate(
         "workflow_audit",
     } <= ledger_tables
     assert public_ledger_tables == 0
-    assert migration_count == 2
-    assert observation_table == "orchestrator_control.late_task_observations"
+    assert migration_count == 3
+    assert observation_table is True
 
 
 def test_create_is_idempotent_and_rejects_conflicting_request_hash(
@@ -611,6 +612,7 @@ def test_operator_resolution_racing_late_observation_preserves_terminal_state(
 
 def test_late_task_observations_migration_upgrades_existing_ledger(
     ledger: WorkflowLedger,
+    tmp_path,
 ) -> None:
     workflow = ledger.create_workflow(_request(), workflow_id=uuid4())
     claim = ledger.claim_dispatch(
@@ -635,7 +637,7 @@ def test_late_task_observations_migration_upgrades_existing_ledger(
     )
 
     database_url = os.environ["ORCHESTRATOR_CHECKPOINT_DATABASE_URL"]
-    with psycopg.connect(database_url) as connection:
+    with privileged_connect() as connection:
         connection.execute(
             """
             INSERT INTO orchestrator_control.workflow_audit (
@@ -668,8 +670,8 @@ def test_late_task_observations_migration_upgrades_existing_ledger(
             """
         )
 
-    ledger.apply_migrations()
-    ledger.apply_migrations()
+    provision_database(tmp_path)
+    provision_database(tmp_path)
     ledger.record_late_task_id(
         workflow.workflow_id,
         claim.attempt_id,
@@ -702,14 +704,15 @@ def test_late_task_observations_migration_upgrades_existing_ledger(
             FROM orchestrator_control.schema_migrations
             WHERE version IN (
                 '001_workflow_ledger.sql',
-                '002_late_task_observations.sql'
+                '002_late_task_observations.sql',
+                '003_audit_append_only.sql'
             )
             """
         ).fetchone()[0]
 
     assert old_audit_count == 2
     assert deduplicated_key_count == 1
-    assert migration_count == 2
+    assert migration_count == 3
 
 
 def test_task_recording_cancellation_and_terminal_state_are_audited(

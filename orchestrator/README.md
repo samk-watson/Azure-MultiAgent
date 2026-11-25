@@ -39,13 +39,23 @@ $env:ORCHESTRATOR_RETAIL_IDENTITY_DATABASE_URL = "postgresql://orchestrator_reta
 $env:ORCHESTRATOR_RETAIL_TEST_ADMIN_DATABASE_URL = "postgresql://orchestrator_checkpoint_admin:$adminPassword@127.0.0.1:5434/orchestrator_retail_test"
 ```
 
-Run plugin-supported migrations only as an explicit bootstrap operation:
+Provisioning is a privileged operation separate from service startup. The
+runtime never runs migrations or saver DDL:
 
 ```powershell
-supply-chain-orchestrator-checkpoint-bootstrap
+$env:ORCHESTRATOR_CHECKPOINT_ADMIN_DATABASE_URL = "<admin login URL, operator only>"
+$env:ORCHESTRATOR_CHECKPOINT_MIGRATOR_DATABASE_URL = "<orchestrator_migrator login URL>"
+supply-chain-orchestrator-provision --dry-run
+supply-chain-orchestrator-provision
 ```
 
-The bootstrap command requires the dedicated database URL and does not run
+See "PostgreSQL roles and provisioning" below for the role model, phases,
+upgrade of persistent volumes, and recovery. The old
+`supply-chain-orchestrator-checkpoint-bootstrap` and
+`supply-chain-orchestrator-ledger-bootstrap` commands remain as privileged
+aliases that require the admin and migrator URLs; they are not runtime tools.
+
+The provisioning command requires the dedicated database URL and nothing runs
 during normal Orchestrator startup. The saver lifecycle helper is available
 from `supply_chain_orchestrator.checkpointing.open_checkpoint_saver`; callers
 must close its async context. Its custom versioned JSON serializer constructs
@@ -70,12 +80,11 @@ database.
 The Orchestrator lifecycle ledger is stored in the separate
 `orchestrator_control` schema in the same dedicated database. It has its own
 versioned migration history and tables for workflow metadata, dispatch
-attempts, and audit events; it does not store full Inventory evidence. Apply
-these migrations explicitly after checkpoint bootstrap:
-
-```powershell
-supply-chain-orchestrator-ledger-bootstrap
-```
+attempts, and audit events; it does not store full Inventory evidence.
+Migrations 001-003 are applied only by the privileged provisioner (the
+migrator is the only identity that writes `schema_migrations`).
+Migration `003_audit_append_only.sql` installs append-only guard triggers on
+`workflow_audit` atomically with its migration row.
 
 `WorkflowLedger.create_workflow` is idempotent for a stable workflow ID and
 request hash; reusing an ID with a different request hash is rejected.
@@ -121,14 +130,9 @@ checkpoint/ledger mismatch fails closed. Terminal checkpoints are returned
 without contacting the Inventory Agent, and `inspect` is read-only and makes
 no A2A calls.
 
-Checkpoint and ledger migrations remain explicit; ordinary durable CLI
-commands never run migrations or fall back to in-memory state. After setting
-the checkpoint and retail identity URLs above, bootstrap each store once:
-
-```powershell
-supply-chain-orchestrator-checkpoint-bootstrap
-supply-chain-orchestrator-ledger-bootstrap
-```
+Checkpoint and ledger provisioning remain explicit; ordinary durable CLI
+commands never run migrations or fall back to in-memory state. Provision the
+store once with `supply-chain-orchestrator-provision` as described below.
 
 Start a durable workflow and retain the returned workflow ID for later
 operations:
@@ -225,3 +229,45 @@ Invalid requests are rejected by the graph before an A2A call. A completed
 task's business result is kept distinct from a failed A2A task. The graph
 accepts an optional LangGraph checkpointer; durable commands use the configured
 PostgreSQL checkpointer.
+
+## PostgreSQL roles and provisioning
+
+| Role | Login | Purpose |
+| --- | --- | --- |
+| `orchestrator_owner` | NOLOGIN | Owns the database, `orchestrator_control`, `public`, all ledger and LangGraph tables, sequences and functions. |
+| `orchestrator_migrator` | LOGIN, NOINHERIT | Member of the owner with `INHERIT FALSE, SET TRUE`; runs migrations and saver DDL via transaction-scoped `SET ROLE`. Never given to the service. |
+| `orchestrator_checkpoint` | LOGIN, nonowner | Runtime. No privileged membership, no CREATE, no ownership. Fixed `search_path = pg_catalog, orchestrator_control, public`. |
+| admin login | superuser | Operator only (role creation, database ownership, lockout). Never given to the service. |
+
+Runtime grants: `workflow_ledger`/`dispatch_attempts` SELECT, INSERT, UPDATE;
+`workflow_audit`/`late_task_observations` SELECT, INSERT (UPDATE, DELETE,
+TRUNCATE are denied and guarded by triggers); `schema_migrations` and
+`checkpoint_migrations` SELECT only; LangGraph `checkpoints`,
+`checkpoint_blobs`, `checkpoint_writes` SELECT, INSERT, UPDATE. DELETE is
+deliberately not granted because the Orchestrator never calls
+`delete_thread`/prune (a test proves `adelete_thread` is rejected); add it
+through a reviewed change if retention pruning is introduced.
+
+`supply-chain-orchestrator-provision` runs restartable phases: 0 preflight,
+1 backup attestation, 2 lockout, 3 roles, 4 database owner, 5 object ownership,
+6 migrations 001-003, 7 saver DDL, 8 grants, 9 catalog verification, 10 unlock,
+11 runtime smoke (a real runtime login must be denied every privileged probe).
+Options: `--dry-run`, `--resume` (required after an interruption),
+`--repair-protection` (reinstalls the migration 003 guard without touching
+migration history), `--backup-manifest <pg_dump custom archive>` and
+`--confirm-service-stopped` (required when existing data is present), and
+`--stop-after <phase>`.
+
+Lockout is per database (`REVOKE CONNECT` plus an in-progress database
+comment); the runtime additionally requires a `ready` database comment that is
+only written after the smoke test, so the service stays stopped until
+verification succeeds even if CONNECT is restored earlier. On a persistent
+volume, Docker init scripts do not rerun: take a `pg_dump -Fc` backup, stop the
+service, then run the provisioner with `--backup-manifest` and
+`--confirm-service-stopped`; it converts an existing runtime-owned database in
+place without dropping data and without changing migrations 001/002.
+Recovery is roll-forward: fix the cause and rerun with `--resume`. Restoring
+the backup is supported only before the service is reopened. The runtime fails
+closed with sanitized, code-only errors for overprivileged credentials, bad
+migration checksums, missing or disabled audit triggers, wrong ownership or
+grants, and a missing ready marker.

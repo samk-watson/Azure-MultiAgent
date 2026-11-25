@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -34,9 +35,17 @@ _TERMINAL_STATES = frozenset({"COMPLETED", "FAILED", "CANCELLED"})
 _PRE_DISPATCH_EVENTS = frozenset(
     {"workflow_created", "cancellation_requested", "workflow_cancelled_before_dispatch"}
 )
+_BUSINESS_EVIDENCE_KEYS = (
+    "inventory_result",
+    "task_id",
+    "task_state",
+    "errors",
+    "inventory_error",
+)
 _CANONICAL_TASK_STATES = {
     "COMPLETED": "TASK_STATE_COMPLETED",
     "CANCELLED": "TASK_STATE_CANCELED",
+    "FAILED": "TASK_STATE_FAILED",
 }
 
 
@@ -343,6 +352,19 @@ class DurableOrchestrator:
         task_id: str | None = None,
         lease_seconds: int = 60,
     ) -> dict[str, Any]:
+        if resolution not in {"TASK_FOUND", "CONFIRMED_NOT_SUBMITTED"}:
+            raise ValueError("resolution is not supported")
+        if not isinstance(reason_code, str) or not re.fullmatch(
+            r"[A-Z][A-Z0-9_]{0,63}", reason_code
+        ):
+            raise ValueError("reason_code is required for operator resolution")
+        if not isinstance(actor_id, str) or not actor_id.strip():
+            raise ValueError("actor_id is required for operator resolution")
+        if resolution == "TASK_FOUND":
+            if not isinstance(task_id, str) or not 1 <= len(task_id) <= 512:
+                raise ValueError("TASK_FOUND resolution requires a valid task_id")
+        elif task_id is not None:
+            raise ValueError("task_id is only valid for TASK_FOUND resolution")
         attempt = self.ledger.get_dispatch_attempt(workflow_id)
         if attempt is None or attempt.dispatch_state != "SUBMISSION_UNKNOWN":
             raise LedgerConflict("Workflow has no unknown submission to resolve")
@@ -414,7 +436,11 @@ class DurableOrchestrator:
             "owner_id": attempt.owner_id,
             "fencing_token": attempt.fencing_token,
             "lease_expires_at": attempt.lease_expires_at,
-            "lease_expired": attempt.lease_expires_at <= datetime.now(timezone.utc),
+            "lease_expired": (
+                attempt.lease_expired
+                if attempt.lease_expired is not None
+                else attempt.lease_expires_at <= datetime.now(timezone.utc)
+            ),
             "error_code": attempt.error_code,
             "cancellation_requested_at": attempt.cancellation_requested_at,
             "created_at": attempt.created_at,
@@ -439,7 +465,11 @@ class DurableOrchestrator:
             if disposition is not None:
                 return disposition
         return self._recovery_inconsistency(
-            record, attempt, reason or "CHECKPOINT_MISSING"
+            record,
+            attempt,
+            "CHECKPOINT_INCOMPLETE"
+            if reason == "CHECKPOINT_INCOMPLETE_WITH_EVIDENCE"
+            else (reason or "CHECKPOINT_MISSING"),
         )
 
     def _ledger_disposition(
@@ -590,6 +620,8 @@ class DurableOrchestrator:
             return "CHECKPOINT_MISSING", None
         raw = values.get("final_result")
         if raw is None:
+            if any(values.get(key) for key in _BUSINESS_EVIDENCE_KEYS):
+                return "CHECKPOINT_INCOMPLETE_WITH_EVIDENCE", None
             return "CHECKPOINT_INCOMPLETE", None
         result = self._final_result(raw)
         if result is None:
@@ -622,11 +654,12 @@ class DurableOrchestrator:
             return "CHECKPOINT_TASK_MISMATCH"
         outcome = self._ledger_outcome(record, attempt)
         inventory = result.inventory_result
+        if result.task_state != self._canonical_task_state(attempt):
+            return "CHECKPOINT_STATUS_MISMATCH"
         if outcome == "COMPLETED":
             if (
                 result.status not in {"complete", "partial", "business_failed"}
                 or inventory is None
-                or result.task_state != "TASK_STATE_COMPLETED"
             ):
                 return "CHECKPOINT_STATUS_MISMATCH"
             expected_status = (
@@ -644,17 +677,9 @@ class DurableOrchestrator:
             ):
                 return "CHECKPOINT_REQUEST_MISMATCH"
         elif outcome == "CANCELLED":
-            if (
-                result.status != "cancelled"
-                or inventory is not None
-                or result.task_state not in {None, "TASK_STATE_CANCELED"}
-            ):
+            if result.status != "cancelled" or inventory is not None:
                 return "CHECKPOINT_STATUS_MISMATCH"
-        elif (
-            result.status != "infrastructure_failed"
-            or inventory is not None
-            or result.task_state in {"TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"}
-        ):
+        elif result.status != "infrastructure_failed" or inventory is not None:
             return "CHECKPOINT_STATUS_MISMATCH"
         return None
 

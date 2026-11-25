@@ -28,9 +28,7 @@ from supply_chain_orchestrator.models import OrchestratorRequest
 def ledger() -> WorkflowLedger:
     if not os.environ.get("ORCHESTRATOR_CHECKPOINT_DATABASE_URL"):
         pytest.skip("ORCHESTRATOR_CHECKPOINT_DATABASE_URL is unset.")
-    instance = WorkflowLedger()
-    instance.apply_migrations()
-    return instance
+    return WorkflowLedger()
 
 
 def _request() -> OrchestratorRequest:

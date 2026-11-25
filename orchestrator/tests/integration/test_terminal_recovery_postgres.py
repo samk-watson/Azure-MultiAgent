@@ -23,11 +23,18 @@ from test_durable_postgres import (
     _run,
     ledger,  # noqa: F401  (fixture)
 )
+from pg_security import privileged_connect, privileged_sql
 
 DB_URL_ENV = "ORCHESTRATOR_CHECKPOINT_DATABASE_URL"
 
 
 def _sql(statement: str, params: tuple = ()) -> list[tuple]:
+    """Privileged SQL for tampering and inspection (admin login, guard triggers bypassed)."""
+    return privileged_sql(statement, params)
+
+
+def _runtime_sql(statement: str, params: tuple = ()) -> list[tuple]:
+    """SQL as the genuine nonowner runtime login."""
     with psycopg.connect(os.environ[DB_URL_ENV]) as connection:
         cursor = connection.execute(statement, params)
         return cursor.fetchall() if cursor.description else []
@@ -136,7 +143,7 @@ def test_ledger_checkpoint_conflicts_are_rejected_without_remote_calls(
     workflow_id = uuid4()
     client = _complete(ledger, workflow_id)
     calls = (client.submission_count, len(client.retrieval_ids))
-    with psycopg.connect(os.environ[DB_URL_ENV]) as connection:
+    with privileged_connect() as connection:
         for part in statement.split(";"):
             if part.strip():
                 connection.execute(part, (workflow_id,) * part.count("%s"))
@@ -491,7 +498,7 @@ def test_identity_and_request_mismatch_checkpoints_fail_closed_in_postgres(
 
 def _write_snapshot() -> tuple:
     """Fingerprint of every ledger and checkpoint row, to prove resume wrote nothing."""
-    with psycopg.connect(os.environ[DB_URL_ENV]) as connection:
+    with privileged_connect(bypass_triggers=False) as connection:
         tables = connection.execute(
             """
             SELECT table_schema, table_name FROM information_schema.tables
@@ -596,7 +603,7 @@ def test_cancelled_workflow_with_dispatch_intent_is_not_pre_dispatch_proof(
     workflow_id = uuid4()
     ledger.create_workflow(_request(), workflow_id=workflow_id)
     ledger.claim_dispatch(workflow_id, owner_id="worker-owner", lease_seconds=60)
-    with psycopg.connect(os.environ[DB_URL_ENV]) as connection:
+    with privileged_connect() as connection:
         connection.execute(
             """
             DELETE FROM orchestrator_control.workflow_audit
@@ -691,7 +698,7 @@ def test_terminal_request_hash_tampering_fails_closed_without_writes(
 ) -> None:
     workflow_id = uuid4()
     client = _complete(ledger, workflow_id)
-    with psycopg.connect(os.environ[DB_URL_ENV]) as connection:
+    with privileged_connect() as connection:
         connection.execute(
             """
             UPDATE orchestrator_control.workflow_ledger

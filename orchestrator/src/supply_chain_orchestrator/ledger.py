@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -16,10 +15,9 @@ import psycopg
 from psycopg import Connection
 
 from supply_chain_orchestrator.checkpointing import (
-    CHECKPOINT_DATABASE_URL_ENV,
-    CheckpointConfigurationError,
     checkpoint_database_url,
     verify_checkpoint_isolation,
+    verify_runtime_privileges,
 )
 from supply_chain_orchestrator.models import OrchestratorRequest
 
@@ -27,7 +25,20 @@ LEDGER_SCHEMA = "orchestrator_control"
 _MIGRATION_NAMES = (
     "001_workflow_ledger.sql",
     "002_late_task_observations.sql",
+    "003_audit_append_only.sql",
 )
+
+
+def migration_sql(migration_name: str) -> str:
+    return (
+        files("supply_chain_orchestrator")
+        .joinpath("migrations", migration_name)
+        .read_text(encoding="utf-8")
+    )
+
+
+def migration_checksum(migration_name: str) -> str:
+    return hashlib.sha256(migration_sql(migration_name).encode("utf-8")).hexdigest()
 _CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _ACTOR_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,127}$")
 _OWNER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,127}$")
@@ -88,6 +99,7 @@ class DispatchAttemptRecord:
     created_at: datetime | None = None
     updated_at: datetime | None = None
     completed_at: datetime | None = None
+    lease_expired: bool | None = None  # evaluated by the database clock
 
 
 @dataclass(frozen=True)
@@ -177,67 +189,12 @@ class WorkflowLedger:
     def _connection(self) -> Iterator[Connection[object]]:
         verify_checkpoint_isolation(self._database_url)
         with psycopg.connect(self._database_url) as connection:
+            verify_runtime_privileges(connection)
             yield connection
 
     @staticmethod
     def _migration_sql(migration_name: str) -> str:
-        return (
-            files("supply_chain_orchestrator")
-            .joinpath("migrations", migration_name)
-            .read_text(encoding="utf-8")
-        )
-
-    def apply_migrations(self) -> None:
-        with self._connection() as connection:
-            connection.execute(
-                "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                ("supply_chain_orchestrator.workflow_ledger.migrations",),
-            )
-            connection.execute(f"CREATE SCHEMA IF NOT EXISTS {LEDGER_SCHEMA}")
-            connection.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {LEDGER_SCHEMA}.schema_migrations (
-                    version text PRIMARY KEY,
-                    checksum char(64) NOT NULL,
-                    applied_at timestamptz NOT NULL DEFAULT clock_timestamp()
-                )
-                """
-            )
-            for migration_name in _MIGRATION_NAMES:
-                sql = self._migration_sql(migration_name)
-                checksum = hashlib.sha256(sql.encode("utf-8")).hexdigest()
-                inserted = connection.execute(
-                    f"""
-                    INSERT INTO {LEDGER_SCHEMA}.schema_migrations (version, checksum)
-                    VALUES (%s, %s)
-                    ON CONFLICT (version) DO NOTHING
-                    RETURNING version
-                    """,
-                    (migration_name, checksum),
-                ).fetchone()
-                if inserted is None:
-                    applied = connection.execute(
-                        f"""
-                        SELECT checksum
-                        FROM {LEDGER_SCHEMA}.schema_migrations
-                        WHERE version = %s
-                        FOR UPDATE
-                        """,
-                        (migration_name,),
-                    ).fetchone()
-                    if applied is None:
-                        raise LedgerConflict(
-                            f"Ledger migration {migration_name} could not be recorded"
-                        )
-                    if applied[0].strip() != checksum:
-                        raise LedgerConflict(
-                            f"Applied ledger migration {migration_name} checksum differs"
-                        )
-                    continue
-
-                for statement in sql.split(";"):
-                    if statement.strip():
-                        connection.execute(statement)
+        return migration_sql(migration_name)
 
     def _require_migrations(self, connection: Connection[object]) -> None:
         exists = connection.execute(
@@ -251,15 +208,21 @@ class WorkflowLedger:
                 "Workflow ledger migrations have not been applied; run explicit ledger bootstrap"
             )
         applied = {
-            row[0]
+            row[0]: row[1].strip()
             for row in connection.execute(
-                f"SELECT version FROM {LEDGER_SCHEMA}.schema_migrations"
+                f"SELECT version, checksum FROM {LEDGER_SCHEMA}.schema_migrations"
             ).fetchall()
         }
-        if not set(_MIGRATION_NAMES) <= applied:
+        if not set(_MIGRATION_NAMES) <= set(applied):
             raise LedgerConflict(
                 "Workflow ledger migrations are incomplete; run explicit ledger bootstrap"
             )
+        for name in _MIGRATION_NAMES:
+            expected = hashlib.sha256(
+                self._migration_sql(name).encode("utf-8")
+            ).hexdigest()
+            if applied[name] != expected:
+                raise LedgerConflict(f"Applied ledger migration {name} checksum differs")
 
     @staticmethod
     def _workflow_record(row: tuple[object, ...]) -> WorkflowRecord:
@@ -459,7 +422,7 @@ class WorkflowLedger:
                 SELECT workflow_id, attempt_id, attempt_number, dispatch_state,
                        owner_id, fencing_token, lease_expires_at, task_id,
                        error_code, cancellation_requested_at, created_at,
-                       updated_at, completed_at
+                       updated_at, completed_at, lease_expires_at <= clock_timestamp()
                 FROM {LEDGER_SCHEMA}.dispatch_attempts
                 WHERE workflow_id = %s
                 """,
@@ -481,6 +444,7 @@ class WorkflowLedger:
             created_at=row[10],
             updated_at=row[11],
             completed_at=row[12],
+            lease_expired=row[13],
         )
 
     def claim_dispatch(
@@ -1190,7 +1154,12 @@ class WorkflowLedger:
                 to_dispatch_state=outcome,
                 fencing_token=fencing_token,
                 task_id=attempt[4],
-                reason_code=error_code,
+                reason_code=(
+                    "CANCELLATION_INTENT_AFTER_COMPLETION"
+                    if outcome == "COMPLETED"
+                    and workflow.cancellation_requested_at is not None
+                    else error_code
+                ),
             )
             return self._select_workflow(connection, workflow_uuid)
 
@@ -1315,18 +1284,3 @@ class WorkflowLedger:
                 reason_code=reason_code,
             )
             return self._select_workflow(connection, workflow_uuid)
-
-
-def ledger_bootstrap_main() -> int:
-    try:
-        url = checkpoint_database_url(
-            os.environ.get(CHECKPOINT_DATABASE_URL_ENV)
-        )
-        WorkflowLedger(url).apply_migrations()
-    except (CheckpointConfigurationError, LedgerError, ValueError) as exc:
-        print(f"Workflow ledger bootstrap configuration error: {exc}")
-        return 2
-    except psycopg.Error as exc:
-        print(f"Workflow ledger bootstrap failed ({type(exc).__name__})")
-        return 1
-    return 0

@@ -35,6 +35,7 @@ from supply_chain_orchestrator.models import (
     OrchestratorRequest,
     OrchestratorResult,
 )
+from supply_chain_orchestrator.security import collect_violations
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +269,35 @@ def verify_checkpoint_isolation(
             )
 
 
+class RuntimePrivilegeError(CheckpointConfigurationError):
+    """The runtime login does not match the approved least-privilege model."""
+
+
+def verify_runtime_privileges(connection: psycopg.Connection) -> None:
+    """Fail closed unless the connected role is the provisioned nonowner runtime."""
+    try:
+        violations = collect_violations(connection)
+    except psycopg.Error:
+        raise RuntimePrivilegeError(
+            "Could not verify the runtime database role privileges"
+        ) from None
+    if violations:
+        raise RuntimePrivilegeError(
+            "Runtime database role failed security verification: "
+            + ", ".join(violations[:8])
+        )
+
+
+def _verify_runtime_privileges_for_url(database_url: str) -> None:
+    try:
+        with psycopg.connect(database_url) as connection:
+            verify_runtime_privileges(connection)
+    except psycopg.Error:
+        raise RuntimePrivilegeError(
+            "Could not verify the runtime database role privileges"
+        ) from None
+
+
 class CheckpointSerializer(SerializerProtocol):
     def dumps_typed(self, obj: Any) -> tuple[str, bytes]:
         if obj is None:
@@ -389,29 +419,9 @@ async def open_checkpoint_saver(
 ) -> AsyncIterator[AsyncPostgresSaver]:
     url = checkpoint_database_url(database_url)
     await asyncio.to_thread(verify_checkpoint_isolation, url)
+    await asyncio.to_thread(_verify_runtime_privileges_for_url, url)
     async with AsyncPostgresSaver.from_conn_string(
         url,
         serde=checkpoint_serializer(),
     ) as saver:
         yield saver
-
-
-async def bootstrap_checkpoint_database(database_url: str | None = None) -> None:
-    async with open_checkpoint_saver(database_url) as saver:
-        await saver.setup()
-    logger.info("Orchestrator checkpoint database bootstrap completed")
-
-
-def bootstrap_main() -> int:
-    try:
-        asyncio.run(
-            bootstrap_checkpoint_database(),
-            loop_factory=asyncio.SelectorEventLoop,
-        )
-    except CheckpointConfigurationError as exc:
-        logger.error("Checkpoint bootstrap configuration error: %s", exc)
-        return 2
-    except psycopg.Error as exc:
-        logger.error("Checkpoint bootstrap failed (%s)", type(exc).__name__)
-        return 1
-    return 0

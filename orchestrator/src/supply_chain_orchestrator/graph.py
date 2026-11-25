@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Mapping
 from typing import Any, Protocol
@@ -23,6 +24,13 @@ from supply_chain_orchestrator.models import (
 from supply_chain_orchestrator.state import OrchestratorState
 
 logger = logging.getLogger(__name__)
+
+
+def _task_ref(task_id: str | None) -> str | None:
+    """Stable non-reversible log reference; the raw task ID stays in the ledger."""
+    if task_id is None:
+        return None
+    return hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:12]
 
 
 class InventoryClient(Protocol):
@@ -164,9 +172,9 @@ def _inventory_node(client: InventoryClient):
                 else "infrastructure_failed"
             )
             logger.warning(
-                "Inventory A2A invocation ended with status=%s task_id=%s correlation_id=%s",
+                "Inventory A2A invocation ended with status=%s task_ref=%s correlation_id=%s",
                 status,
-                error.task_id,
+                _task_ref(error.task_id),
                 state["correlation_id"],
             )
             return {
@@ -181,8 +189,8 @@ def _inventory_node(client: InventoryClient):
             }
 
         logger.info(
-            "Inventory A2A invocation completed task_id=%s task_state=%s correlation_id=%s",
-            invocation.task_id,
+            "Inventory A2A invocation completed task_ref=%s task_state=%s correlation_id=%s",
+            _task_ref(invocation.task_id),
             invocation.task_state,
             state["correlation_id"],
         )
