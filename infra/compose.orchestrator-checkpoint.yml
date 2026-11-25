@@ -1,0 +1,24 @@
+services:
+  orchestrator-checkpoint-postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: orchestrator_checkpoint_admin
+      POSTGRES_PASSWORD: ${ORCHESTRATOR_CHECKPOINT_ADMIN_PASSWORD:?Set ORCHESTRATOR_CHECKPOINT_ADMIN_PASSWORD}
+      ORCHESTRATOR_CHECKPOINT_RUNTIME_PASSWORD: ${ORCHESTRATOR_CHECKPOINT_RUNTIME_PASSWORD:?Set ORCHESTRATOR_CHECKPOINT_RUNTIME_PASSWORD}
+      ORCHESTRATOR_CHECKPOINT_MIGRATOR_PASSWORD: ${ORCHESTRATOR_CHECKPOINT_MIGRATOR_PASSWORD:?Set ORCHESTRATOR_CHECKPOINT_MIGRATOR_PASSWORD}
+      ORCHESTRATOR_RETAIL_PROBE_PASSWORD: ${ORCHESTRATOR_RETAIL_PROBE_PASSWORD:?Set ORCHESTRATOR_RETAIL_PROBE_PASSWORD}
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - orchestrator_checkpoint_pgdata:/var/lib/postgresql/data
+      - ./postgres/init-orchestrator-checkpoint.sh:/docker-entrypoint-initdb.d/10-orchestrator-checkpoint.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orchestrator_checkpoint_admin -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  orchestrator_checkpoint_pgdata:
